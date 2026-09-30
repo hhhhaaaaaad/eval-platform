@@ -78,6 +78,13 @@ class GovernanceDecisionExpectation(BaseModel):
 
     ``memory_ids`` 用内容哈希而非裸 id 定位——id 要等 seed 之后才存在，且 reset 后会变。
     标注时写内容，运行时用 seed 返回的 ``contentToId`` 解析。
+
+    ``merged_into_content`` 显式表达「合并到哪条」，而不是约定
+    ``memory_contents`` 的某个位置（如「最后一个元素是存活者」）。
+    位置约定看着省事，实际是隐患：JSON 数组的顺序人写时不可靠，
+    写反了不会报错，只会让「误合并率」静默地算在另一批样本上；
+    而且约定只存在于文档里，schema 校验拦不住任何东西。
+    显式字段让「哪条是目标」成为可校验的事实。
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -85,7 +92,26 @@ class GovernanceDecisionExpectation(BaseModel):
     action: str
     memory_ids: list[int] = Field(default_factory=list)
     memory_contents: list[str] = Field(default_factory=list)
+    #: 仅 ``action=MERGE`` 时有意义：被合并到的（存活下来的）那条记忆的内容。
+    merged_into_content: str | None = None
     reason: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_merge_target(self) -> GovernanceDecisionExpectation:
+        """MERGE 必须给出合并目标，非 MERGE 不该给。
+
+        两个方向都拦，因为两种写错都会让指标失真却看不出异常：
+        MERGE 缺目标 → 无法判断合并对不对，只能退化成「动作对了就算对」；
+        非 MERGE 给了目标 → 标注员多半是复制粘贴时漏改 action，实际语义不明。
+        """
+        is_merge = self.action.strip().upper() == "MERGE"
+        if is_merge and not (self.merged_into_content or "").strip():
+            raise ValueError("action=MERGE 时必须提供 merged_into_content（合并到哪条记忆）")
+        if not is_merge and self.merged_into_content is not None:
+            raise ValueError(
+                f"action={self.action} 不应提供 merged_into_content（仅 MERGE 有意义）"
+            )
+        return self
 
 
 # ---------------------------------------------------------------------------
