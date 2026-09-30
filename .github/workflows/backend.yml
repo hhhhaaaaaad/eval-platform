@@ -1,0 +1,91 @@
+name: backend
+
+# 只在本仓库的后端相关路径变更时触发：
+# 前端改一行样式不该跑后端测试，文档改动也不该占用 CI 配额。
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend.yml"
+  pull_request:
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend.yml"
+
+# 同一分支连续推送时取消上一次未完成的运行：
+# 评测平台的测试会真实读写 Postgres，堆积的并发运行会互相争抢行锁。
+concurrency:
+  group: backend-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # 测试依赖真实的 Postgres 与 Redis（租约 CAS、partial unique index、
+    # eval_run_guard 的行锁都只有在真库上才有意义），故起服务容器而不是 mock。
+    # 端口刻意与本地开发一致（15432 / 16380），避免 CI 与本地跑出不同行为。
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: eval
+          POSTGRES_PASSWORD: eval
+          POSTGRES_DB: eval_platform_ci
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd "pg_isready -U eval -d eval_platform_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports:
+          - 16380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql+psycopg://eval:eval@localhost:15432/eval_platform_ci
+      REDIS_URL: redis://localhost:16380/0
+      # 后端不该在 CI 里读系统代理：GitHub runner 无代理，显式关闭可避免
+      # 「本地能过、CI 挂」这类只在特定网络环境复现的差异。
+      JAVA_EVAL_TRUST_ENV: "false"
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # 与 backend/Dockerfile 保持一致，避免「CI 过、镜像里装不上」。
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # 迁移必须在测试之前跑：eval_run_guard 的单行初始记录由迁移 INSERT，
+      # 缺失时 RunService._acquire_exclusive_guard 会明确报错而非静默降级。
+      - name: 应用数据库迁移
+        run: python -m alembic upgrade head
+
+      # ruff 先跑：静态检查比集成测试快得多，格式/未用导入这类问题
+      # 不该等到 50 秒的测试套件跑完才暴露。
+      - name: 静态检查（ruff）
+        run: python -m ruff check .
+
+      - name: 测试（pytest）
+        run: python -m pytest -q
