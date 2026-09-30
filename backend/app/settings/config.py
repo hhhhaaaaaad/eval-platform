@@ -54,10 +54,15 @@ class Settings(BaseSettings):
     # 关闭不会丢 run——pending 状态的 run 可由调度器补投（idx_runs_pending 即为此存在）。
     enqueue_runs: bool = True
 
-    # 独占守卫的失效阈值：持锁 run 超过这个时长未更新心跳，视为已死、允许接管。
-    # 与租约心跳（EP-7 的 reaper）刻意共用同一个值——两处用不同阈值会导致
-    # 「reaper 认为它还活着、守卫认为它可以被抢」这种互相矛盾的判断。
-    exclusive_guard_stale_seconds: int = 300
+    # 租约时长：worker 超过这个时长未更新心跳即视为已死，run 可被接管/回收。
+    # **独占守卫的陈旧阈值复用同一个值**（见 app.runs.service._guard_is_stale）——
+    # 两处用不同阈值会得出互相矛盾的判断：「reaper 认为持有者还活着、
+    # 守卫认为它的锁可以抢」，进而两个 run 同时以为自己独占。
+    run_lease_seconds: int = 300
+
+    # 单次 run 的最大重试次数。租约超时被回收时，未耗尽的重试会把 run 放回
+    # pending 重新排队；耗尽则置 failed，避免坏 run 无限占用调度。
+    run_max_retries: int = 3
 
     # 默认值仅用于本地开发，生产必须用环境变量覆盖。
     # 长度须 >= 32 字节：短于 32 字节时 PyJWT 会发 InsecureKeyLengthWarning

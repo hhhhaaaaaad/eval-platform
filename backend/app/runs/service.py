@@ -265,10 +265,13 @@ class RunService:
 
         ``heartbeat_at`` 为空视为**过期**：守卫的语义是「持锁者定期报到」，
         从未报到的锁无法证明持有者活着，按死锁处理比一直堵着更安全。
+
+        阈值复用 ``run_lease_seconds``（与 reaper 同源），不能各用各的——
+        见该配置项的注释。
         """
         if guard.heartbeat_at is None:
             return True
-        stale_after = timedelta(seconds=get_settings().exclusive_guard_stale_seconds)
+        stale_after = timedelta(seconds=get_settings().run_lease_seconds)
         return (now - guard.heartbeat_at) > stale_after
 
     def release_exclusive_guard(self, run_id: uuid.UUID) -> bool:
