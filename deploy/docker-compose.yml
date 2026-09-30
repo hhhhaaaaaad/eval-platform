@@ -1,0 +1,152 @@
+# 记忆系统独立评测平台 —— 本地编排（Compose V2，已废弃顶层 version 键）
+#
+# 存储隔离策略：平台与 AgentWrite 物理隔离，绝不共用 Postgres/Redis。
+#   平台      : Postgres 15432 / Redis 16380 / API 8093 / Flower 5555 / 前端 5173
+#   AgentWrite: MySQL 13306 / Redis 16379 / Qdrant 6333 / Java eval 8092
+#
+# 宿主侧端口固定暴露为 15432 / 16380（对齐 backend/app/settings/config.py 默认值）；
+# 容器网络内则通过服务名互访（eval-postgres:5432 / eval-redis:6379），
+# 因此这里显式覆盖 DATABASE_URL / REDIS_URL —— 容器内的 localhost 无法指向兄弟容器。
+#
+# 使用前：cp deploy/env.example deploy/.env（env_file 引用的 .env 必须存在）。
+
+name: eval-platform
+
+services:
+  # ---------------------------------------------------------------------------
+  # 平台自身元数据存储（用户 / 数据集 / run / 结果）
+  # ---------------------------------------------------------------------------
+  eval-postgres:
+    image: postgres:16
+    container_name: eval-postgres
+    environment:
+      POSTGRES_USER: eval
+      POSTGRES_PASSWORD: eval
+      POSTGRES_DB: eval_platform
+    ports:
+      - "15432:5432"
+    volumes:
+      - eval_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eval -d eval_platform"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - eval-platform
+
+  # ---------------------------------------------------------------------------
+  # Celery broker + result backend
+  # ---------------------------------------------------------------------------
+  eval-redis:
+    image: redis:7
+    container_name: eval-redis
+    ports:
+      - "16380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - eval-platform
+
+  # ---------------------------------------------------------------------------
+  # FastAPI 应用
+  # ---------------------------------------------------------------------------
+  eval-api:
+    build:
+      context: ../backend
+    container_name: eval-api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8093
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://eval:eval@eval-postgres:5432/eval_platform
+      REDIS_URL: redis://eval-redis:6379/0
+      API_PORT: "8093"
+    ports:
+      - "8093:8093"
+    depends_on:
+      eval-postgres:
+        condition: service_healthy
+      eval-redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - eval-platform
+
+  # ---------------------------------------------------------------------------
+  # Celery worker —— 方案要求 local 环境并发数为 1
+  # ---------------------------------------------------------------------------
+  eval-worker:
+    build:
+      context: ../backend
+    container_name: eval-worker
+    command: celery -A app.tasks.celery_app:celery_app worker --loglevel=info --concurrency=1
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://eval:eval@eval-postgres:5432/eval_platform
+      REDIS_URL: redis://eval-redis:6379/0
+    depends_on:
+      eval-postgres:
+        condition: service_healthy
+      eval-redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - eval-platform
+
+  # ---------------------------------------------------------------------------
+  # Celery beat —— 周期任务调度
+  # ---------------------------------------------------------------------------
+  eval-beat:
+    build:
+      context: ../backend
+    container_name: eval-beat
+    command: celery -A app.tasks.celery_app:celery_app beat --loglevel=info
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://eval:eval@eval-postgres:5432/eval_platform
+      REDIS_URL: redis://eval-redis:6379/0
+    depends_on:
+      eval-redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - eval-platform
+
+  # ---------------------------------------------------------------------------
+  # Flower —— Celery 监控面板（HTTP Basic Auth，凭据从环境变量读取，默认 eval/eval）
+  # ---------------------------------------------------------------------------
+  eval-flower:
+    build:
+      context: ../backend
+    container_name: eval-flower
+    # $$ 转义 Compose 插值，交由容器内 shell 展开 $FLOWER_USER / $FLOWER_PASSWORD
+    command: celery -A app.tasks.celery_app:celery_app flower --port=5555 --basic_auth=$${FLOWER_USER:-eval}:$${FLOWER_PASSWORD:-eval}
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://eval-redis:6379/0
+    ports:
+      - "5555:5555"
+    depends_on:
+      eval-redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - eval-platform
+
+volumes:
+  eval_pg_data:
+    name: eval_pg_data
+
+networks:
+  eval-platform:
+    name: eval-platform

@@ -1,0 +1,27 @@
+# 关键：不把本地 venv 打进镜像（否则镜像会凭空多出上百 MB）
+.venv/
+venv/
+
+# Python 缓存与构建产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# 测试与静态检查缓存（测试不进生产镜像）
+tests/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 环境与 IDE
+.env
+.env.*
+.idea/
+.vscode/
+
+# 版本控制与文档
+.git/
+.gitignore
+*.md

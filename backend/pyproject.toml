@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "memory-eval-platform"
+version = "0.1.0"
+description = "记忆系统独立评测平台后端（FastAPI + Celery + Alembic 骨架）"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    "psycopg[binary]>=3.1",
+    "redis>=5.0",
+    "celery[redis]>=5.3",
+    "httpx>=0.27",
+    "pyjwt>=2.8",
+    "bcrypt>=4.1",
+]
+
+[project.optional-dependencies]
+# 开发/测试依赖：pytest 跑单测，respx 做 httpx 契约 mock，ruff 做静态检查。
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+    "ruff>=0.4",
+]
+
+[tool.hatch.build.targets.wheel]
+# 只打包 app 包；tests/alembic 不进 wheel。
+packages = ["app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# asyncio_mode=auto：async def 测试无需逐个加 @pytest.mark.asyncio。
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
