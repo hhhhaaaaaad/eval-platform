@@ -1,2 +1,1 @@
-// 通用组件目录占位导出：EP-0 仅建立目录与导出入口，EP-1 起在此实现真实组件。
-export {};
+export { default as StatusBadge, statusLabel } from './StatusBadge';

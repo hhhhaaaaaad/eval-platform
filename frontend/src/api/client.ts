@@ -2,6 +2,8 @@
 // 为什么自己封装：统一拼接后端前缀、统一把非 2xx 转成可识别的 ApiError，
 // 避免每个页面重复处理 status 判断与响应体读取。
 
+import { clearSession, getToken } from './session';
+
 const API_BASE = '/api/v1';
 
 // 非 2xx 响应统一抛出的错误类型，携带 HTTP 状态码与响应体摘要，便于页面展示与后续判定（如 503 未就绪）。
@@ -17,16 +19,25 @@ export class ApiError extends Error {
   }
 }
 
+// 单个请求的附加选项。
+export interface RequestOptions {
+  // 登录接口自身的密码错误也是 401，若也触发「清 token + 跳登录」会把
+  // 错误提示冲掉，故登录请求显式跳过该兜底，改由调用方就地展示错误。
+  skipUnauthorizedRedirect?: boolean;
+}
+
 function buildHeaders(hasBody: boolean): Record<string, string> {
   const headers: Record<string, string> = { Accept: 'application/json' };
   if (hasBody) {
     headers['Content-Type'] = 'application/json';
   }
 
-  // TODO(P0-1): 鉴权接入点。
-  // 后端加入 JWT/Token 后在此注入 Authorization 头，例如：
-  //   const token = getToken();
-  //   if (token) headers['Authorization'] = `Bearer ${token}`;
+  // P0-1 鉴权接入点：有 token 时注入 Authorization 头。
+  // 未登录（无 token）时静默不带，让后端返回 401 由下方统一兜底。
+  const token = getToken();
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
 
   return headers;
 }
@@ -47,10 +58,21 @@ async function toApiError(response: Response): Promise<ApiError> {
   );
 }
 
-async function request<T>(path: string, init: RequestInit): Promise<T> {
+// 401 全局兜底：token 已失效或非法时，清空会话并回登录页。
+// 用整页跳转而非 SPA 内导航，是为了让所有页面组件随路由守卫一起重新评估，
+// 避免「已清 token 但当前页仍在渲染」的半死状态。
+function redirectToLogin(): void {
+  window.location.assign('/login');
+}
+
+async function request<T>(path: string, init: RequestInit, options?: RequestOptions): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, init);
 
   if (!response.ok) {
+    if (response.status === 401 && !options?.skipUnauthorizedRedirect) {
+      clearSession();
+      redirectToLogin();
+    }
     throw await toApiError(response);
   }
 
@@ -67,14 +89,22 @@ async function request<T>(path: string, init: RequestInit): Promise<T> {
   return JSON.parse(text) as T;
 }
 
-export function apiGet<T>(path: string): Promise<T> {
-  return request<T>(path, { method: 'GET', headers: buildHeaders(false) });
+export function apiGet<T>(path: string, options?: RequestOptions): Promise<T> {
+  return request<T>(path, { method: 'GET', headers: buildHeaders(false) }, options);
 }
 
-export function apiPost<T>(path: string, body: unknown): Promise<T> {
-  return request<T>(path, {
-    method: 'POST',
-    headers: buildHeaders(true),
-    body: JSON.stringify(body),
-  });
+export function apiPost<T>(
+  path: string,
+  body: unknown,
+  options?: RequestOptions,
+): Promise<T> {
+  return request<T>(
+    path,
+    {
+      method: 'POST',
+      headers: buildHeaders(true),
+      body: JSON.stringify(body),
+    },
+    options,
+  );
 }

@@ -10,7 +10,9 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://localhost:8093',
+        // 用 127.0.0.1 而非 localhost：Windows 下 Node 会把 localhost 优先解析成 IPv6 ::1，
+        // 而后端只监听 IPv4（0.0.0.0:8093），导致代理连接被拒（ECONNREFUSED ::1:8093）。
+        target: 'http://127.0.0.1:8093',
         changeOrigin: true,
       },
     },

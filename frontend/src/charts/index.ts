@@ -1,2 +1,1 @@
-// 图表目录占位导出：EP-0 仅建立目录与导出入口，EP-1 起在此实现雷达图 / 趋势图 / A-B 对比。
-export {};
+export { default as DimensionChart } from './DimensionChart';
