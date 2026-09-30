@@ -1,0 +1,8 @@
+# 依赖与构建产物（镜像内由 npm ci / vite build 重新生成，不拷贝宿主产物）
+node_modules/
+dist/
+.vite/
+
+# 版本控制与日志
+.git/
+*.log

@@ -14,11 +14,14 @@ HTTP 状态码映射遵循「调用方能否通过改请求来解决」：
 
 from __future__ import annotations
 
+from typing import cast
+
 from fastapi import APIRouter, HTTPException, Request, status
 
 from app.auth.deps import AdminUser, CurrentUser, DbSession
 from app.datasets.schemas import (
     CaseInput,
+    CaseType,
     DatasetCreateRequest,
     DatasetResponse,
     DatasetVersionDetail,
@@ -196,7 +199,7 @@ def get_version(version_id: int, db: DbSession, _user: CurrentUser) -> DatasetVe
         config=version.config,
         cases=[
             CaseInput(
-                case_type=case.case_type,
+                case_type=cast(CaseType, case.case_type),
                 group_key=case.group_key,
                 payload=case.payload,
                 ground_truth=case.ground_truth,

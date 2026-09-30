@@ -18,7 +18,7 @@ governance              task（四类治理任务之一）        decisions[]
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -155,7 +155,7 @@ def _validate_conversation_case(payload: dict[str, Any], ground_truth: dict[str,
     """对话→记忆对：必须有非空 messages，且 ground truth 记忆非空。"""
     _require(bool(payload.get("dialogue_id")), "payload.dialogue_id 不能为空", field="payload.dialogue_id")
 
-    messages = payload.get("messages")
+    messages = cast(list[Any], payload.get("messages"))
     _require(isinstance(messages, list) and len(messages) > 0, "payload.messages 必须是非空数组", field="payload.messages")
     for index, message in enumerate(messages):
         _require(
@@ -164,7 +164,7 @@ def _validate_conversation_case(payload: dict[str, Any], ground_truth: dict[str,
             field=f"payload.messages[{index}]",
         )
 
-    memories = ground_truth.get("ground_truth_memories")
+    memories = cast(list[Any], ground_truth.get("ground_truth_memories"))
     _require(
         isinstance(memories, list) and len(memories) > 0,
         "ground_truth.ground_truth_memories 必须是非空数组（没有答案的用例无法计算 P/R）",
@@ -209,8 +209,8 @@ def _validate_query_case(payload: dict[str, Any], ground_truth: dict[str, Any]) 
     query = payload.get("query")
     _require(isinstance(query, str) and query.strip() != "", "payload.query 不能为空白", field="payload.query")
 
-    ids = ground_truth.get("relevant_memory_ids")
-    contents = ground_truth.get("relevant_memory_contents")
+    ids = cast(list[Any], ground_truth.get("relevant_memory_ids"))
+    contents = cast(list[Any], ground_truth.get("relevant_memory_contents"))
     has_ids = isinstance(ids, list) and len(ids) > 0
     has_contents = isinstance(contents, list) and len(contents) > 0
 
@@ -248,7 +248,7 @@ def _validate_governance_case(payload: dict[str, Any], ground_truth: dict[str, A
     allowed = ("duplicates", "consistency", "expired", "hallucination")
     _require(task in allowed, f"payload.task 必须是 {allowed} 之一，实际: {task}", field="payload.task")
 
-    decisions = ground_truth.get("decisions")
+    decisions = cast(list[Any], ground_truth.get("decisions"))
     # 允许 decisions 为空数组：某些治理样本就是「什么都不该做」的反例，
     # 这类负样本恰恰是检验误伤率的关键，不能因为空就判非法。
     _require(isinstance(decisions, list), "ground_truth.decisions 必须是数组", field="ground_truth.decisions")

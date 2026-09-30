@@ -19,7 +19,7 @@ from collections.abc import Callable
 from typing import Any, Self
 
 import httpx
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from app.connector import errors as err
 from app.connector.errors import (
@@ -63,7 +63,7 @@ _logger = get_logger(__name__)
 _SUMMARY_LIMIT = 500
 
 
-def _parse_model(model: type) -> Callable[[Any], Any]:
+def _parse_model(model: type[BaseModel]) -> Callable[[Any], Any]:
     """构造严格的单对象解析器：结构不符即抛契约错误，绝不猜测字段。"""
 
     def _parse(raw: Any) -> Any:
@@ -80,7 +80,7 @@ def _parse_model(model: type) -> Callable[[Any], Any]:
     return _parse
 
 
-def _parse_model_list(model: type) -> Callable[[Any], Any]:
+def _parse_model_list(model: type[BaseModel]) -> Callable[[Any], Any]:
     """构造严格的数组解析器（Java 侧返回 ``List<X>`` 时 data 是数组）。"""
 
     def _parse(raw: Any) -> Any:

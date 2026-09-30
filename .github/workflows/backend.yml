@@ -70,12 +70,15 @@ jobs:
           # 与 backend/Dockerfile 保持一致，避免「CI 过、镜像里装不上」。
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: backend/pyproject.toml
+          cache-dependency-path: |
+            backend/pyproject.toml
+            backend/requirements.lock.txt
 
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install -r requirements.lock.txt
+          pip install -e . --no-deps
 
       # 迁移必须在测试之前跑：eval_run_guard 的单行初始记录由迁移 INSERT，
       # 缺失时 RunService._acquire_exclusive_guard 会明确报错而非静默降级。
@@ -86,6 +89,10 @@ jobs:
       # 不该等到 50 秒的测试套件跑完才暴露。
       - name: 静态检查（ruff）
         run: python -m ruff check .
+
+      # mypy 与 ruff 并列：都是静态检查，早于集成测试暴露类型问题。
+      - name: 静态检查（mypy）
+        run: python -m mypy app
 
       - name: 测试（pytest）
         run: python -m pytest -q

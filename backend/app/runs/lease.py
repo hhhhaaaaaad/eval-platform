@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass
+from typing import Any, cast
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -200,7 +201,7 @@ class LeaseManager:
         区分原因只会诱导出「某些情况下可以继续」的错误分支。
         """
         result = self._db.execute(text(_HEARTBEAT_SQL), {"run_id": str(run_id), "owner": owner})
-        alive = result.rowcount == 1
+        alive = cast(Any, result).rowcount == 1
         if not alive:
             logger.warning("心跳失败，已失去租约", extra={"run_id": str(run_id)})
         return alive
@@ -234,7 +235,7 @@ class LeaseManager:
                 "result_summary": json.dumps(result_summary or {}, ensure_ascii=False),
             },
         )
-        written = result.rowcount == 1
+        written = cast(Any, result).rowcount == 1
         if not written:
             logger.warning(
                 "run 结束写入被拒（租约已易主或状态已变）",

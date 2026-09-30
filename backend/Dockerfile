@@ -9,21 +9,10 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # 依赖单独一层：只要依赖清单不变，改业务代码时不会重装依赖。
-# 注意：此列表必须与 pyproject.toml 的 [project].dependencies 保持一致——
-# Dockerfile 无法直接消费 pyproject 的依赖段而不安装本项目包，故此处显式列出。
-RUN pip install --no-cache-dir \
-    "fastapi>=0.115" \
-    "uvicorn[standard]>=0.32" \
-    "pydantic>=2.9" \
-    "pydantic-settings>=2.6" \
-    "sqlalchemy>=2.0.36" \
-    "alembic>=1.14" \
-    "psycopg[binary]>=3.2" \
-    "redis>=5.2" \
-    "celery[redis]>=5.4" \
-    "httpx>=0.28" \
-    "pyjwt>=2.10" \
-    "bcrypt>=4.2"
+# 从锁定文件安装已解析的版本快照，保证镜像与本地 504 测试、CI 跑的是同一组版本。
+# 锁文件是完整 venv 快照，故也包含 pytest/mypy 等 dev 工具。
+COPY requirements.lock.txt ./
+RUN pip install --no-cache-dir -r requirements.lock.txt
 
 # 源码层（.venv / __pycache__ / tests 等由 .dockerignore 排除）
 COPY . .

@@ -1,0 +1,72 @@
+# 已解析的依赖版本快照（resolved version snapshot）。
+#
+# 本文件记录当前 venv 里「527 个测试全绿」的那一组精确版本（含 runtime 与
+# dev/test 工具，如 pytest / respx / ruff / mypy）。CI 与 Docker 镜像都从本文件
+# 安装，保证换台机器装出的版本组合与本地验证过的一致。
+#
+# pyproject.toml 的 [project].dependencies / [project.optional-dependencies].dev
+# 仍是直接依赖的唯一真源。升级或增删依赖时，请改 pyproject.toml，重装进 venv，
+# 再重新生成本文件（重新生成时请保留本段头注释）：
+#
+#   ./.venv/Scripts/python.exe -m pip freeze | grep -viE "memory-eval-platform|^-e |@ file:" >> requirements.lock.txt
+#
+alembic==1.20.0
+amqp==5.4.0
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.15.1
+ast_serialize==0.11.2
+bcrypt==5.0.0
+billiard==4.3.0
+celery==5.6.3
+certifi==2026.7.22
+click==8.5.0
+click-didyoumean==0.3.1
+click-plugins==1.1.1.2
+click-repl==0.4.0
+colorama==0.4.6
+fastapi==0.142.1
+h11==0.16.0
+httpcore==1.0.9
+httptools==0.8.0
+httpx==0.28.1
+idna==3.20
+iniconfig==2.3.0
+kombu==5.6.2
+librt==0.16.0
+Mako==1.4.3
+MarkupSafe==3.0.3
+mypy==2.3.1
+mypy_extensions==1.1.0
+opentelemetry-api==1.45.0
+packaging==26.3
+pathspec==1.1.1
+pluggy==1.6.0
+prompt_toolkit==3.0.53
+psycopg==3.3.6
+psycopg-binary==3.3.6
+pydantic==2.13.5
+pydantic-settings==2.15.0
+pydantic_core==2.46.5
+Pygments==2.21.0
+PyJWT==2.15.1
+pytest==9.1.1
+pytest-asyncio==1.4.0
+python-dateutil==2.9.0.post0
+python-dotenv==1.2.3
+PyYAML==6.0.3
+redis==6.4.0
+respx==0.23.1
+ruff==0.16.9
+six==1.17.0
+SQLAlchemy==2.1.1
+starlette==1.7.0
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+tzdata==2026.4
+tzlocal==5.4.4
+uvicorn==0.54.0
+vine==5.1.0
+watchfiles==1.3.0
+wcwidth==0.9.1
+websockets==17.1

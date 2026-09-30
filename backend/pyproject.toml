@@ -29,6 +29,7 @@ dev = [
     "pytest-asyncio>=0.23",
     "respx>=0.21",
     "ruff>=0.4",
+    "mypy>=1.11",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -43,3 +44,10 @@ asyncio_mode = "auto"
 [tool.ruff]
 line-length = 110
 target-version = "py311"
+
+[tool.mypy]
+python_version = "3.12"
+# 本项目用了不少无 py.typed / stub 的库（celery、respx 等），关闭缺失导入报错。
+ignore_missing_imports = true
+# 让多余的 # type: ignore 能被发现，避免注解漂移。
+warn_unused_ignores = true
