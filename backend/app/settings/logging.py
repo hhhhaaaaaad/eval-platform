@@ -25,7 +25,22 @@ request_id_var: ContextVar[str] = ContextVar("request_id", default="-")
 
 # JsonFormatter/PlainFormatter 额外提取的关联字段（仅当 record 上存在时才写），
 # 便于把一条日志串到具体的 run/case/stage/endpoint。
-_EXTRA_FIELDS = ("run_id", "case_id", "stage", "endpoint", "status", "attempt")
+#
+# 这里是**白名单**：未登记的 extra 键不会出现在输出里。新增关联字段必须同步登记，
+# 否则 connector 传了 extra 却看不到（EP-3 验收要求日志含 run_id/eval_user_id/endpoint/status，
+# 其中 eval_user_id 就必须登记后才能输出）。
+_EXTRA_FIELDS = (
+    "run_id",
+    "case_id",
+    "stage",
+    "endpoint",
+    "status",
+    "attempt",
+    "eval_user_id",
+    "code",
+    "retryable",
+    "delay",
+)
 
 
 class JsonFormatter(logging.Formatter):
