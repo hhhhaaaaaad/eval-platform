@@ -148,6 +148,69 @@ def poll_run(
     return last
 
 
+def cleanup(
+    *,
+    dataset_version_id: int,
+    param_snapshot_id: int,
+    model_version_id: int,
+) -> None:
+    """删除本次冒烟造出的数据。
+
+    **必须显式清理**：这些接口都会 commit，没有回滚可依赖。不清理的话每次冒烟
+    都往库里堆一份数据集+run，跑几十次后库就很难看了，还会让别处
+    「全库没有 XX」这类断言莫名变红（这个坑已在测试里踩过两次）。
+
+    只删本次冒烟造出的行，按外键依赖倒序：run → 用例/版本 → 数据集 → 配置。
+    """
+    from sqlalchemy import text
+
+    from app.db.session import get_session_factory
+
+    session = get_session_factory()()
+    try:
+        # 先取出 dataset_id——版本行一删就查不到它了，顺序反了会删不掉数据集。
+        dataset_id = session.execute(
+            text("SELECT dataset_id FROM eval_dataset_versions WHERE id = :v"),
+            {"v": dataset_version_id},
+        ).scalar_one_or_none()
+
+        run_rows = session.execute(
+            text("SELECT id FROM eval_runs WHERE dataset_version_id = :v"),
+            {"v": dataset_version_id},
+        ).scalars().all()
+        for run_id in run_rows:
+            # 独占守卫可能仍指着这个 run
+            session.execute(
+                text("UPDATE eval_run_guard SET exclusive_owner = NULL, owner_run_id = NULL, "
+                     "acquired_at = NULL, heartbeat_at = NULL WHERE exclusive_owner = :r"),
+                {"r": run_id},
+            )
+        session.execute(
+            text("DELETE FROM eval_runs WHERE dataset_version_id = :v"), {"v": dataset_version_id}
+        )
+        session.execute(
+            text("DELETE FROM eval_cases WHERE dataset_version_id = :v"), {"v": dataset_version_id}
+        )
+        session.execute(
+            text("DELETE FROM eval_dataset_versions WHERE id = :v"), {"v": dataset_version_id}
+        )
+        if dataset_id is not None:
+            session.execute(text("DELETE FROM eval_datasets WHERE id = :d"), {"d": dataset_id})
+        session.execute(
+            text("DELETE FROM eval_param_snapshots WHERE id = :s"), {"s": param_snapshot_id}
+        )
+        session.execute(
+            text("DELETE FROM eval_model_versions WHERE id = :m"), {"m": model_version_id}
+        )
+        session.commit()
+        print(f"[ OK ] 已清理本次冒烟数据（run {len(run_rows)} 个）")
+    except Exception as exc:  # noqa: BLE001 — 清理失败不该掩盖冒烟结论
+        session.rollback()
+        print(f"[WARN] 清理未完成（不影响冒烟结论）: {exc}", file=sys.stderr)
+    finally:
+        session.close()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="评测平台端到端冒烟")
     parser.add_argument("--base", default=DEFAULT_BASE)
@@ -155,6 +218,11 @@ def main() -> int:
     parser.add_argument("--password", default=os.environ.get("EVAL_SMOKE_PASSWORD", ""))
     parser.add_argument("--expect", default="failed", choices=["failed", "succeeded"])
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    parser.add_argument(
+        "--keep",
+        action="store_true",
+        help="保留本次冒烟造出的数据（默认成功时清理，失败时一律保留现场供排查）",
+    )
     args = parser.parse_args()
 
     if not args.password:
@@ -210,6 +278,18 @@ def main() -> int:
             _fail(f"run 卡在 {status} —— 任务可能没被消费，或 worker 崩了")
         if status != args.expect:
             _fail(f"终态 {status} 与期望 {args.expect} 不符")
+
+        # 清理放在最后，且**只在成功时做**：失败时保留现场，run/checkpoint/error_message
+        # 都是排查线索，删掉就等于把证据扔了。
+        if args.keep:
+            print(f"[ .. ] 按 --keep 保留数据：run_id={run_id} dataset_version_id={version_id}")
+        else:
+            cleanup(
+                dataset_version_id=version_id,
+                param_snapshot_id=snapshot_id,
+                model_version_id=model_id,
+            )
+
         _ok("冒烟通过")
     return 0
 
