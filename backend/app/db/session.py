@@ -9,6 +9,7 @@ from __future__ import annotations
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.db.registry import import_all_models
 from app.settings.config import get_settings
 
 _engine: Engine | None = None
@@ -31,6 +32,11 @@ def get_engine() -> Engine:
 def get_session_factory() -> sessionmaker[Session]:
     global _session_factory
     if _session_factory is None:
+        # 先补齐模型注册再建工厂：所有 ORM 使用路径都经过这里，因此这是保证
+        # Base.metadata 完整的唯一必要位置。缺了它，只导入部分模型的进程
+        # （如仅 import app.datasets 的 worker）会在解析外键时抛
+        # NoReferencedTableError。幂等且惰性，不增加模块导入成本。
+        import_all_models()
         _session_factory = sessionmaker(
             bind=get_engine(), autoflush=False, expire_on_commit=False
         )

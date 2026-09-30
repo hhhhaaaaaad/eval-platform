@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from app import __version__
 from app.api.health import router as health_router
 from app.auth.api import router as auth_router
+from app.datasets.api import router as datasets_router
 from app.settings.config import get_settings
 from app.settings.logging import RequestIdMiddleware, configure_logging, get_logger
 
@@ -46,6 +47,7 @@ def create_app() -> FastAPI:
     app.add_middleware(RequestIdMiddleware)
     app.include_router(health_router, prefix="/api/v1")
     app.include_router(auth_router, prefix="/api/v1")
+    app.include_router(datasets_router, prefix="/api/v1")
     return app
 
 
