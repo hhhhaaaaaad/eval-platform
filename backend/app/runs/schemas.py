@@ -146,6 +146,31 @@ class CaseResultResponse(BaseModel):
     detail: dict[str, Any]
 
 
+class TrendPoint(BaseModel):
+    """走势上的一个点：一次 run 在该指标上的取值。"""
+
+    run_id: uuid.UUID
+    created_at: datetime
+    metric_value: float
+    #: run 的终态。**必须带上**：失败或未完成的 run 指标可能缺省为 0，
+    #: 在图上会表现为「指标突然掉到 0」——那不是退步，是这次没跑出结果。
+    #: 没有这一列，看趋势的人会把基础设施故障误读成系统能力下降。
+    status: str
+
+
+class MetricTrendResponse(BaseModel):
+    """单个指标随时间的走势。
+
+    刻意只返回一个指标而不是「一次给全部」：趋势图是一张图一条线，
+    前端按需拉取比一次拉全量再筛更省，也避免响应体随维度数增长。
+    """
+
+    dimension: str
+    metric_name: str
+    #: 按时间升序，可直接喂给图表（时间轴从左到右）。
+    points: list[TrendPoint]
+
+
 class RunCasesResponse(BaseModel):
     """逐 case 明细的**分页**响应。
 

@@ -626,3 +626,142 @@ class TestResults:
 
     def test_results_require_auth(self, client: TestClient, run_id: str) -> None:
         assert client.get(f"/api/v1/runs/{run_id}/results").status_code == 401
+
+
+class TestMetricTrend:
+    """指标走势查询。
+
+    这是「结果落库」真正的用处——在 ``result_summary`` 那个 JSONB blob 上做跨 run 聚合
+    要么走 GIN + 复杂路径表达式、要么全表扫描，而结果表天生就是可聚合的形状。
+    """
+
+    @pytest.fixture
+    def run_id(
+        self,
+        client: TestClient,
+        admin: _Actor,
+        seeded_config: dict[str, int],
+        dispatched: _Dispatched,
+    ) -> str:
+        resp = client.post(
+            "/api/v1/runs", json=_payload(seeded_config, mode="exact"), headers=admin.headers
+        )
+        assert resp.status_code == 201
+        return resp.json()["id"]
+
+    @pytest.fixture
+    def limited_run_id(
+        self,
+        client: TestClient,
+        admin: _Actor,
+        seeded_config: dict[str, int],
+        dispatched: _Dispatched,
+    ) -> str:
+        """同配置但 ``case_limit=1`` 的另一个 run。
+
+        它能与上面那个并存，本身就依赖「case_limit 参与 config_fingerprint」——
+        不含它的话两个 run 指纹相同，第二个会撞 ``uq_runs_active_cfg`` 得到 409。
+        """
+        resp = client.post(
+            "/api/v1/runs",
+            json=_payload(seeded_config, mode="exact", case_limit=1),
+            headers=admin.headers,
+        )
+        assert resp.status_code == 201, resp.text
+        return resp.json()["id"]
+
+    def _seed_point(
+        self, db: Session, run_id: str, *, metric: str, value: float, when: str
+    ) -> None:
+        _insert_run_metric(db, run_id, "retrieval", metric, value)
+        # 显式定时间，避免依赖两次创建的先后（同微秒时排序不稳定）
+        db.execute(
+            text("UPDATE eval_runs SET created_at = :t WHERE id = :r"),
+            {"t": when, "r": run_id},
+        )
+
+    def test_trend_points_are_chronological_and_carry_status(
+        self,
+        client: TestClient,
+        db: Session,
+        admin: _Actor,
+        run_id: str,
+        limited_run_id: str,
+    ) -> None:
+        # limited_run_id 先（时间更早），run_id 后——断言返回是升序而非插入序
+        self._seed_point(db, limited_run_id, metric="recall_at_k", value=0.4, when="2026-01-01T00:00:00Z")
+        self._seed_point(db, run_id, metric="recall_at_k", value=0.8, when="2026-01-02T00:00:00Z")
+        db.commit()
+
+        body = client.get(
+            "/api/v1/runs/trend?dimension=retrieval&metric=recall_at_k", headers=admin.headers
+        ).json()
+
+        assert body["dimension"] == "retrieval"
+        assert body["metric_name"] == "recall_at_k"
+
+        # 趋势查询**按设计就是全库范围**的（它回答的是「这个指标历次怎么变的」），
+        # 因此断言分两层：整体时间有序 + 本用例那两个点的相对顺序正确。
+        # 直接断言「恰好等于两个点」在存有历史 run 的开发库上必然失败，
+        # 而那与被测逻辑毫无关系。
+        points = body["points"]
+        timestamps = [p["created_at"] for p in points]
+        assert timestamps == sorted(timestamps), "按时间升序，可直接喂给图表"
+
+        mine = [p for p in points if p["run_id"] in {run_id, limited_run_id}]
+        assert [p["metric_value"] for p in mine] == [0.4, 0.8]
+
+        # status 必须带上：失败/未完成的 run 指标可能缺省为 0，图上表现为「突然掉到 0」，
+        # 没有 status 的话看趋势的人会把基础设施故障误读成系统能力下降。
+        assert all("status" in point for point in points)
+
+    def test_trend_can_be_scoped_to_one_config_fingerprint(
+        self,
+        client: TestClient,
+        db: Session,
+        admin: _Actor,
+        run_id: str,
+        limited_run_id: str,
+    ) -> None:
+        fingerprint = db.execute(
+            text("SELECT config_fingerprint FROM eval_runs WHERE id = :r"), {"r": run_id}
+        ).scalar_one()
+        self._seed_point(db, run_id, metric="recall_at_k", value=0.9, when="2026-01-01T00:00:00Z")
+        self._seed_point(db, limited_run_id, metric="recall_at_k", value=0.1, when="2026-01-02T00:00:00Z")
+        db.commit()
+
+        body = client.get(
+            f"/api/v1/runs/trend?dimension=retrieval&metric=recall_at_k"
+            f"&config_fingerprint={fingerprint}",
+            headers=admin.headers,
+        ).json()
+
+        # 两个 run 的 case_limit 不同 → 指纹不同；限定后只剩一个点。
+        # 不限定就会把「限量 1 条」与「跑满」的指标画进同一条曲线——那正是
+        # case_limit 参与指纹要解决的问题。
+        assert [p["run_id"] for p in body["points"]] == [run_id]
+
+    def test_trend_of_unknown_metric_is_empty_not_404(
+        self, client: TestClient, admin: _Actor
+    ) -> None:
+        """没有数据是空数组，不是 404——「这个指标还没跑过」与「这个接口不存在」是两回事。"""
+        resp = client.get(
+            "/api/v1/runs/trend?dimension=retrieval&metric=no_such_metric", headers=admin.headers
+        )
+        assert resp.status_code == 200
+        assert resp.json()["points"] == []
+
+    def test_trend_path_is_not_captured_by_run_id_route(
+        self, client: TestClient, admin: _Actor
+    ) -> None:
+        """`/runs/trend` 必须命中趋势端点，而不是被 `/runs/{run_id}` 抓走。
+
+        若把 trend 声明在 `/runs/{run_id}` 之后，"trend" 会被当作 UUID 解析并返回 422，
+        而不是走趋势逻辑。FastAPI 按声明顺序匹配，所以**声明顺序在这里是语义的一部分**。
+        这条用例就是钉住那个顺序的——没有它，将来有人调整路由顺序不会有任何提示。
+        """
+        resp = client.get(
+            "/api/v1/runs/trend?dimension=retrieval&metric=recall_at_k", headers=admin.headers
+        )
+        assert resp.status_code == 200, resp.text
+        assert "points" in resp.json(), "应返回趋势结构，而不是 UUID 解析失败的 422"

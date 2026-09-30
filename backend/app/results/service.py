@@ -29,6 +29,7 @@ from __future__ import annotations
 import math
 import uuid
 from collections.abc import Iterable, Mapping
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
@@ -37,6 +38,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.results.models import CaseResult, RunResult
+from app.runs.models import Run
 from app.settings.logging import get_logger
 
 logger = get_logger(__name__)
@@ -220,6 +222,51 @@ class ResultReader:
         if dimension is not None:
             stmt = stmt.where(CaseResult.dimension == dimension)
         return int(self._db.execute(stmt).scalar_one())
+
+    def metric_trend(
+        self,
+        *,
+        dimension: str,
+        metric_name: str,
+        config_fingerprint: str | None = None,
+        limit: int = 100,
+    ) -> list[tuple[uuid.UUID, datetime, float, str]]:
+        """取某指标随时间的走势，返回 ``[(run_id, 创建时间, 值, run 状态)]``，按时间升序。
+
+        **这是结果落库真正的用处**：``run.result_summary`` 是个 JSONB blob，
+        在上面做跨 run 聚合要么走 GIN + 复杂路径表达式、要么全表扫描；
+        而 ``eval_run_results`` 天生是 ``(run_id, dimension, metric_name, value)`` 的形状，
+        索引直接可用。
+
+        ``limit`` 取**最近 N 个**而不是最早 N 个：看趋势的人关心的是近期，
+        而升序返回是为了直接喂给图表（时间轴从左到右）。
+        实现上先按时间倒序取 N 条再反转——一步 ``ORDER BY DESC LIMIT`` 加一次内存反转，
+        比子查询套正序更简单也更省。
+        """
+        stmt = (
+            select(
+                RunResult.run_id,
+                Run.created_at,
+                RunResult.metric_value,
+                Run.status,
+            )
+            .join(Run, Run.id == RunResult.run_id)
+            .where(
+                RunResult.dimension == dimension,
+                RunResult.metric_name == metric_name,
+            )
+            .order_by(Run.created_at.desc())
+            .limit(limit)
+        )
+        if config_fingerprint is not None:
+            # 只在同一配置指纹内比较：不同指纹的指标本就不可比（数据集/参数/模型/mode 任一不同）。
+            stmt = stmt.where(Run.config_fingerprint == config_fingerprint)
+
+        rows = self._db.execute(stmt).all()
+        return [
+            (run_id, created_at, float(value), status)
+            for run_id, created_at, value, status in reversed(rows)
+        ]
 
     def case_results(
         self,

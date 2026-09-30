@@ -22,11 +22,13 @@ from app.runs.schemas import (
     DimensionMetrics,
     ExperimentCreateRequest,
     ExperimentResponse,
+    MetricTrendResponse,
     RunCasesResponse,
     RunCreateRequest,
     RunCreateResponse,
     RunResponse,
     RunResultsResponse,
+    TrendPoint,
 )
 from app.runs.service import (
     ExclusiveGuardUnavailableError,
@@ -165,6 +167,40 @@ def list_runs(
         status=run_status, config_fingerprint=config_fingerprint, limit=limit
     )
     return [RunResponse.model_validate(row) for row in runs]
+
+
+@router.get("/runs/trend", response_model=MetricTrendResponse)
+def get_metric_trend(
+    db: DbSession,
+    _user: CurrentUser,
+    dimension: str = Query(description="维度名，如 retrieval"),
+    metric_name: str = Query(alias="metric", description="指标名，如 recall_at_k"),
+    config_fingerprint: str | None = Query(
+        default=None,
+        description="限定在同一配置指纹内比较。跨指纹的指标不可比，不传会混入不同数据集/参数的 run",
+    ),
+    limit: int = Query(default=100, ge=1, le=1000, description="取最近多少次 run"),
+) -> MetricTrendResponse:
+    """单指标随时间的走势。
+
+    **路径必须声明在 ``/runs/{run_id}`` 之前**：``trend`` 是一个字面量单段路径，
+    会被 ``/runs/{run_id}`` 捕获并把 "trend" 当作 UUID 解析，报出 422 而不是走这里。
+    FastAPI 按声明顺序匹配，所以顺序在这里是语义的一部分，不是风格问题。
+    """
+    points = ResultReader(db).metric_trend(
+        dimension=dimension,
+        metric_name=metric_name,
+        config_fingerprint=config_fingerprint,
+        limit=limit,
+    )
+    return MetricTrendResponse(
+        dimension=dimension,
+        metric_name=metric_name,
+        points=[
+            TrendPoint(run_id=run_id, created_at=created_at, metric_value=value, status=status)
+            for run_id, created_at, value, status in points
+        ],
+    )
 
 
 @router.get("/runs/{run_id}", response_model=RunResponse)
