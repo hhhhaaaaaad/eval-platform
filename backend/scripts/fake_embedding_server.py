@@ -58,6 +58,7 @@ import argparse
 import json
 import math
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import ClassVar
 
 #: 与 AgentWrite 的 `memory.qdrant.vector-size` 必须一致：不一致时 Qdrant
 #: 会以维度不符拒绝写入，而那是个足够醒目的错误，不需要在这里再加校验。
@@ -102,8 +103,10 @@ def embed_text(text: str, dim: int) -> list[float]:
 class _Handler(BaseHTTPRequestHandler):
     """最小 OpenAI 兼容 embedding 端点。"""
 
-    dim = DEFAULT_DIM
-    stats = {"requests": 0, "texts": 0}
+    dim: ClassVar[int] = DEFAULT_DIM
+    #: 调用统计（类属性），由子类/实例共享——用于回答「这个替身真的被调到了吗」。
+    #: 显式标注 ClassVar 而不是让 ruff 把可变字面量当成实例字段的默认值。
+    stats: ClassVar[dict[str, int]] = {"requests": 0, "texts": 0}
 
     def _read_body(self) -> bytes:
         """读请求体，**同时支持 Content-Length 与 chunked**。
@@ -136,7 +139,8 @@ class _Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         return self.rfile.read(length) if length else b""
 
-    def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler 的接口约定
+    # do_POST / do_GET 的驼峰命名是 BaseHTTPRequestHandler 的接口约定，不是笔误。
+    def do_POST(self) -> None:
         raw = self._read_body()
         try:
             body = json.loads(raw.decode("utf-8"))
@@ -172,7 +176,7 @@ class _Handler(BaseHTTPRequestHandler):
             },
         )
 
-    def do_GET(self) -> None:  # noqa: N802
+    def do_GET(self) -> None:
         """健康检查与调用统计：用来确认「这个替身真的被调到了」。"""
         self._send(200, {"status": "ok", "dim": self.dim, **type(self).stats})
 
@@ -184,8 +188,10 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
-    def log_message(self, fmt: str, *args: object) -> None:  # noqa: A002
-        """默认实现会为每个请求打一行日志；本服务只关心统计，静音以免淹没控制台。"""
+    # 形参名沿用基类的 `format`/`*args` 签名（因此这里用 fmt 只是本地命名，不改基类契约）；
+    # 覆盖它是为了静音逐请求日志——本服务只关心计数，否则日志会淹没控制台。
+    def log_message(self, fmt: str, *args: object) -> None:
+        """默认实现会为每个请求打一行日志；本服务只关心统计，故静音。"""
 
 
 def main() -> int:
