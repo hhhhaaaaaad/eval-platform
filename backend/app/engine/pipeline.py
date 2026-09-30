@@ -50,6 +50,7 @@ from app.datasets.digest import (
     CASE_TYPE_QUERY_TO_MEMORY,
 )
 from app.datasets.models import Case, DatasetVersion
+from app.engine.dimensions.consistency import ConsistencyEvaluator
 from app.engine.dimensions.extraction import ExtractedCandidate, ExtractionEvaluator
 from app.engine.dimensions.governance import (
     GOVERNANCE_TASKS,
@@ -64,6 +65,7 @@ from app.engine.dimensions.retrieval import (
 )
 from app.params.models import ParamSnapshot
 from app.results import (
+    DIMENSION_CONSISTENCY,
     DIMENSION_EXTRACTION,
     DIMENSION_GOVERNANCE,
     DIMENSION_INJECTION,
@@ -113,6 +115,28 @@ class PipelineFailure(Exception):
         super().__init__(message)
         self.stage = stage
         self.should_release_fencing = should_release_fencing
+
+
+@dataclass
+class GovernanceObservation:
+    """治理观测：**一次采集，两个维度共用**。
+
+    ``governance/replay`` 的入参是「跑哪几类治理分析」的开关，**不是某个 case**——
+    它每次返回的都是整个命名空间的决策。因此同一个 run 里：
+
+    - 维度⑤（治理质量）用它逐 case 比对期望决策；
+    - 维度③（一致性）用它统计「系统自己把多少条判为重复/冲突/过期残留」。
+
+    两个维度对同一批决策提不同的问题，所以决策只采一次、由两者共享。
+    分别采集的话每个 run 要多打 4 次 replay（每 task 一次），而结果完全相同。
+    """
+
+    #: 逐 case 的对应关系（仅 governance case）
+    cases: list[tuple[Case, list[ReplayedDecision]]]
+    #: 按治理任务分组的全命名空间决策
+    decisions_by_task: dict[str, list[ReplayedDecision]]
+    #: 命名空间里应有多少条记忆（本次 seed 的语料规模），用作一致性比率的分母
+    total_memories: int
 
 
 @dataclass
@@ -228,12 +252,12 @@ class RunPipeline:
             with self._stage(Stage.INJECTION):
                 injected = self._stage_injection(run, client, completed)
             with self._stage(Stage.GOVERNANCE):
-                governed = self._stage_governance(run, client, completed)
+                governance = self._stage_governance(run, client, completed)
             with self._stage(Stage.EXTRACTION):
                 extracted = self._stage_extraction(run, client, completed)
             with self._stage(Stage.METRICS):
                 metrics = self._stage_metrics(
-                    run, collected, injected, governed, extracted, completed
+                    run, collected, injected, governance, extracted, completed
                 )
             with self._stage(Stage.FINALIZE):
                 self._stage_finalize(run, client, completed, metrics)
@@ -320,6 +344,10 @@ class RunPipeline:
         #
         # 放在 checkpoint 而不是新列：它是**本次运行的中间产物**，不是配置，
         # 且天然随 run 生命周期存在（断点续跑时 checkpoint 保留，因此 map 也还在）。
+        # seeded_total 是一致性维度比率的分母（「在这批记忆里，系统把多少条判为重复」）。
+        # 用**发出去**的条数而不是响应里的 inserted+existed：分母要回答的是
+        # 「命名空间里应该有多少条」，而不是「Java 报告处理了多少条」。
+        run.checkpoint = {**run.checkpoint, "seeded_total": len(items)}
         if outcome.content_to_id:
             run.checkpoint = {**run.checkpoint, "seeded_content_to_id": outcome.content_to_id}
         logger.info(
@@ -611,34 +639,29 @@ class RunPipeline:
 
     def _stage_governance(
         self, run: Run, client: JavaEvalClient, completed: list[str]
-    ) -> list[tuple[Case, list[Any]]]:
-        """对治理 case 跑 ``governance/replay``，收集实际决策。
+    ) -> GovernanceObservation:
+        """跑 ``governance/replay`` 采集决策，供维度⑤与维度③共用。
 
         **每种 task 只调一次 replay**，而不是每个 case 一次：replay 的入参是
         「跑哪几类治理分析」的开关，不是「针对哪条记忆」。同一 task 下的所有 case
         共享同一次分析的输出。按开关逐 task 调用（而不是四个开关全开调一次）
         是为了能**把决策归属到 task**——全开时返回的是一个混合列表，
         无法判断某条决策来自重复检测还是过期检测。
+
+        **四个 task 全跑，不管有没有对应的 case**：维度③（一致性）要统计全部四类
+        系统动作，它不依赖 case。没有 case 就不调 replay 的话，一致性维度会拿到
+        空决策并报出「一致率 100%」——最不该出现的误读。
         """
+        total_memories = int(run.checkpoint.get("seeded_total") or 0)
         if Stage.GOVERNANCE.value in completed:
-            return []
+            return GovernanceObservation(
+                cases=[], decisions_by_task={}, total_memories=total_memories
+            )
         self._check_lease(run)
 
         cases = self._governance_cases(run)
-        if not cases:
-            logger.info("无治理 case，跳过治理维度", extra={"run_id": str(run.id)})
-            self._mark_stage(run, completed, Stage.GOVERNANCE)
-            return []
-
-        tasks = sorted(
-            {
-                str(case.payload.get("task") or "")
-                for case in cases
-                if str(case.payload.get("task") or "")
-            }
-        )
-        by_task: dict[str, list[Any]] = {}
-        for task in tasks:
+        by_task: dict[str, list[ReplayedDecision]] = {}
+        for task in GOVERNANCE_TASKS:
             self._check_lease(run)
             flags = {name: name == task for name in GOVERNANCE_TASKS}
             decisions = client.governance_replay(run.eval_user_id, **flags)
@@ -648,13 +671,15 @@ class RunPipeline:
             (case, by_task.get(str(case.payload.get("task") or ""), [])) for case in cases
         ]
         logger.info(
-            "治理观测完成: %d 个 case, task=%s",
+            "治理观测完成: %d 个 case, 命名空间记忆数=%d",
             len(collected),
-            tasks,
+            total_memories,
             extra={"run_id": str(run.id)},
         )
         self._mark_stage(run, completed, Stage.GOVERNANCE)
-        return collected
+        return GovernanceObservation(
+            cases=collected, decisions_by_task=by_task, total_memories=total_memories
+        )
 
     def _stage_extraction(
         self, run: Run, client: JavaEvalClient, completed: list[str]
@@ -696,7 +721,7 @@ class RunPipeline:
         run: Run,
         collected: list[tuple[Case, list[RetrievedItem]]],
         injected: list[tuple[Case, int, list[str]]],
-        governed: list[tuple[Case, list[Any]]],
+        governance: GovernanceObservation,
         extracted: list[tuple[Case, list[ExtractedCandidate]]],
         completed: list[str],
     ) -> dict[str, dict[str, float]]:
@@ -764,15 +789,33 @@ class RunPipeline:
                 ),
             )
 
-        if governed:
+        # 维度③一致性：对整个命名空间做一次巡检。**没有 case 概念**，因此只写维度级聚合，
+        # 不写逐 case 明细（eval_case_results 的主键含 case_id，它没有 case 可指）。
+        # 它不是准确度度量而是**系统行为度量**：不需要任何标注，问的是
+        # 「系统自己把这批记忆里的多少条判为重复/冲突/过期残留」。
+        # 这也是它能与维度⑤共用同一批 replay 决策的原因（见 GovernanceObservation）。
+        consistency = ConsistencyEvaluator().evaluate(
+            total_memories=governance.total_memories,
+            decisions_by_task=governance.decisions_by_task,
+        )
+        by_dimension[DIMENSION_CONSISTENCY] = consistency.as_metric_values()
+        writer.write_dimension_metrics(
+            run.id,
+            DIMENSION_CONSISTENCY,
+            by_dimension[DIMENSION_CONSISTENCY],
+            detail=consistency.as_detail(),
+        )
+
+        if governance.cases:
+            id_to_content = self._seeded_id_to_content(run)
             governance_results = [
                 self._governance_evaluator.evaluate_case(
                     payload=case.payload,
                     ground_truth=case.ground_truth,
                     decisions=decisions,
-                    id_to_content=self._seeded_id_to_content(run),
+                    id_to_content=id_to_content,
                 )
-                for case, decisions in governed
+                for case, decisions in governance.cases
             ]
             by_dimension[DIMENSION_GOVERNANCE] = self._governance_evaluator.aggregate(
                 governance_results
@@ -785,7 +828,9 @@ class RunPipeline:
                 DIMENSION_GOVERNANCE,
                 (
                     (case.id, result.as_metric_values(), result.as_detail())
-                    for (case, _), result in zip(governed, governance_results, strict=True)
+                    for (case, _), result in zip(
+                        governance.cases, governance_results, strict=True
+                    )
                 ),
             )
 

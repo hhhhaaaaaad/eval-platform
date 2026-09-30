@@ -8,6 +8,7 @@
 """
 
 from app.results.service import (
+    DIMENSION_CONSISTENCY,
     DIMENSION_EXTRACTION,
     DIMENSION_GOVERNANCE,
     DIMENSION_INJECTION,
@@ -17,6 +18,7 @@ from app.results.service import (
 )
 
 __all__ = [
+    "DIMENSION_CONSISTENCY",
     "DIMENSION_EXTRACTION",
     "DIMENSION_GOVERNANCE",
     "DIMENSION_INJECTION",

@@ -49,6 +49,7 @@ DIMENSION_RETRIEVAL = "retrieval"
 DIMENSION_INJECTION = "injection"
 DIMENSION_GOVERNANCE = "governance"
 DIMENSION_EXTRACTION = "extraction"
+DIMENSION_CONSISTENCY = "consistency"
 
 
 def _to_decimal(value: float, *, where: str) -> Decimal:

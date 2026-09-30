@@ -470,8 +470,9 @@ def test_dimension_metrics_are_persisted_to_result_table(
         {"r": str(run_id)},
     ).scalars().all()
     # 检索与注入共用同一批 query case，所以两个维度都会有结果；
-    # 治理维度没有 governance case，因此不出现（而不是出现一个空维度）。
-    assert dimensions == ["injection", "retrieval"]
+    # 一致性无 case 依赖、恒定产出；
+    # 治理与抽取没有对应的 case，因此不出现（而不是出现一个空维度）。
+    assert dimensions == ["consistency", "injection", "retrieval"]
 
 
 @respx.mock
@@ -564,6 +565,60 @@ def test_resume_reads_metrics_back_from_database(
 
     run = _reload(db, run_id)
     assert run.result_summary["retrieval"]["recall_at_k"] == pytest.approx(1.0)
+
+
+@respx.mock
+def test_consistency_dimension_scans_the_whole_namespace(
+    db: Session, run_id: uuid.UUID, java: _JavaStub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """一致性维度接线：统计整个命名空间，分母是本次 seed 的语料规模。
+
+    数据集里**没有 governance case**，这个维度照样有产出——它不是逐 case 的，
+    问的是「系统对这批记忆做了哪些动作」。这也正是它不需要任何标注的原因。
+    """
+    java.install()
+    outcome = _pipeline(db, monkeypatch).execute(run_id)
+    db.commit()
+
+    assert outcome.status == "succeeded"
+    consistency = outcome.metrics["consistency"]
+
+    # metrics 只有各比率（可聚合的数值）；total_memories 与各类原始计数在 detail 里
+    # ——与其余维度「数值进 metric_values、解释性上下文进 detail」的分工一致。
+    assert set(consistency) == {
+        "duplicate_rate",
+        "conflict_rate",
+        "consistency_rate",
+        "expired_residue_rate",
+        "quarantine_rate",
+    }
+    # stub 对四类 task 都返回空决策 → 「系统没发现问题」→ 一致率 1.0。
+    # 注意这与「没有数据」不同：后者 total_memories=0 且 answerable=False、一致率 0。
+    assert consistency["duplicate_rate"] == pytest.approx(0.0)
+    assert consistency["conflict_rate"] == pytest.approx(0.0)
+    assert consistency["consistency_rate"] == pytest.approx(1.0)
+    assert consistency["expired_residue_rate"] == pytest.approx(0.0)
+
+    # 它没有 case 概念，因此**不应**产生逐 case 明细行（写进去会因为没有真实 case_id 而失败）
+    case_rows = db.execute(
+        text(
+            "SELECT count(*) FROM eval_case_results "
+            "WHERE run_id = :r AND dimension = 'consistency'"
+        ),
+        {"r": str(run_id)},
+    ).scalar_one()
+    assert case_rows == 0, "一致性是对整个命名空间的巡检，没有逐 case 明细"
+
+    # 但原始计数必须落进维度级 detail：只给比率的话「一致率 1.0」是 0/2 还是 0/0 看不出来
+    detail = db.execute(
+        text(
+            "SELECT detail FROM eval_run_results "
+            "WHERE run_id = :r AND dimension = 'consistency' LIMIT 1"
+        ),
+        {"r": str(run_id)},
+    ).scalar_one()
+    assert detail["total_memories"] == 2
+    assert detail["answerable"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -941,9 +996,12 @@ def test_governance_replays_once_per_task_and_is_not_case_limited(
 
     assert outcome.status == "succeeded"
 
-    # 1) 逐 task 调用，且每次只开对应开关（replay_tasks 里出现 None 就说明全开了）
-    assert sorted(java.replay_tasks) == ["duplicates", "expired"]
-    assert java.calls["governance_replay"] == 2
+    # 1) 逐 task 调用，且每次只开对应开关（replay_tasks 里出现 None 就说明四个开关全开了）。
+    #    四个 task 都要跑，即使数据集里只有两类治理 case——一致性维度统计的是
+    #    「系统对这批记忆做了哪些动作」，它不依赖 case；少跑一个 task 就等于把
+    #    那一类动作当成「没有发现问题」，并报出虚高的一致率。
+    assert sorted(java.replay_tasks) == ["consistency", "duplicates", "expired", "hallucination"]
+    assert java.calls["governance_replay"] == 4
 
     # 2) 不限量：case_limit=1 只砍掉 query case，治理两条都评了
     assert outcome.metrics["retrieval"]["case_count"] == 1.0
