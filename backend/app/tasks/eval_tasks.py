@@ -24,15 +24,28 @@ logger = get_logger(__name__)
 
 
 def _owner_name() -> str:
-    """租约持有者标识：进程内的 hostname+pid 足够区分并发 worker。
+    """租约持有者标识：hostname+pid 足够区分并发 worker。
 
-    不用 UUID：排障时「谁在跑这个 run」要能从标识直接读出来，
-    随机串只能靠反查日志。
+    不用 UUID：排障时「谁在跑这个 run」要能从标识直接读出来，随机串只能靠反查日志。
+
+    **必须是纯 ASCII**：这个值会进 ``X-Eval-Run-Id`` 请求头，而 HTTP 头值按规范
+    是 ASCII（httpx 会 ``value.encode("ascii")``，非 ASCII 直接抛 UnicodeEncodeError）。
+    中文 Windows 机器名（如「某某的电脑」）会让 worker 一启动任务就崩，
+    且崩在**错误处理路径**上——失败记录都写不下去。实跑时踩过这个坑。
+    非 ASCII 机器名退化为哈希后缀：失去可读性，但换来跨环境可用。
     """
+    import hashlib
     import os
     import socket
 
-    return f"{socket.gethostname()}:{os.getpid()}"
+    host = socket.gethostname()
+    try:
+        host.encode("ascii")
+    except UnicodeEncodeError:
+        digest = hashlib.sha256(host.encode("utf-8")).hexdigest()[:8]
+        logger.info("机器名含非 ASCII 字符，owner 退化为哈希后缀：%s -> host-%s", host, digest)
+        host = f"host-{digest}"
+    return f"{host}:{os.getpid()}"
 
 
 @celery_app.task(name="app.tasks.eval_tasks.execute_run", bind=True)

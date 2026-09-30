@@ -122,16 +122,24 @@ class JavaEvalClient:
         circuit_breaker: CircuitBreaker | None = None,
         retry_policy: RetryPolicy | None = None,
         transport: httpx.BaseTransport | None = None,
+        trust_env: bool = False,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._token = token
         # 不要对评测端点做 URL 重定向跟随：redirect 会静默改变目标，
         # 破坏「请求的确打到了哪个端点」的可追溯性。
+        #
+        # trust_env=False 是**必须的**，不是可选的优化。httpx 默认会读取环境/系统代理，
+        # 于是访问本机 Java 服务也会被绕进代理——在有代理的开发机上（国内很常见）
+        # 表现为收到代理返回的 **502**，看起来像 Java 服务坏了，实际请求根本没到它。
+        # 这个坑实跑时踩过：本地 8092 无监听，日志里却是 HTTP 502 而非连接拒绝。
+        # 内部服务端点不该走环境代理；确有需要时用 java_eval_trust_env 显式打开。
         self._client = httpx.Client(
             base_url=self._base_url,
             timeout=timeout,
             follow_redirects=False,
             transport=transport,
+            trust_env=trust_env,
         )
         self._rate_limiter = rate_limiter or RateLimiter(rate_per_second=20.0, burst=10)
         self._circuit = circuit_breaker or CircuitBreaker()
@@ -146,6 +154,7 @@ class JavaEvalClient:
             "token": settings.java_eval_token,
             "timeout": settings.java_eval_timeout_seconds,
             "max_retries": settings.java_eval_max_retries,
+            "trust_env": settings.java_eval_trust_env,
         }
         kwargs.update(overrides)
         return cls(**kwargs)

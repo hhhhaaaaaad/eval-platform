@@ -543,3 +543,34 @@ def test_seed_items_include_all_ground_truth_as_distractors(
 
     assert len(items) == 2
     assert {item.content for item in items} == {"用户用 Java 17", "用户偏好美式咖啡"}
+
+
+# ---------------------------------------------------------------------------
+# 失败阶段标注
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_failure_stage_is_labelled_with_actual_stage(
+    db: Session, run_id: uuid.UUID, java: _JavaStub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """失败阶段必须标注正确。
+
+    实跑时发现过：fencing 阶段连不上 Java，``error_message`` 却写着 ``[search]``——
+    因为兜底的 ``except JavaEvalError`` 硬编码了 ``stage=Stage.SEARCH``。
+    **错误的阶段标注比不标注更糟**：它会把排障的人引到完全错误的阶段去查。
+    """
+    java.install()
+    respx.get(url__regex=rf"{BASE}/api/v1/eval/fencing/\d+").mock(
+        side_effect=httpx.ConnectError("connection refused")
+    )
+
+    outcome = _pipeline(db, monkeypatch).execute(run_id)
+    db.commit()
+
+    assert outcome.status == "failed"
+    run = _reload(db, run_id)
+    # 阶段要写进可查询的字段，而不只是自由文本
+    assert run.current_stage == "fencing"
+    assert "[fencing]" in (run.error_message or "")
+    assert "search" not in (run.error_message or "")

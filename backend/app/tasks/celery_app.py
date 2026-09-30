@@ -16,10 +16,24 @@ from app.settings.config import get_settings
 
 settings = get_settings()
 
+# ``include`` 不是可选项：worker 以 ``-A app.tasks.celery_app.celery_app`` 启动时，
+# **只会导入本模块**，其他任务模块里的 ``@celery_app.task`` 装饰器根本不会执行，
+# 任务因此不会注册。后果是 worker 收到任务后打印
+# ``Received unregistered task ... The message has been ignored and discarded``
+# 然后**直接丢弃**——而 API 侧 ``delay()`` 只负责投递到 broker，
+# 投递成功照样返回 True，于是 run 永远停在 pending。
+#
+# 这个 bug 在单元测试里完全看不见（测试直接调函数，不经过 worker 的任务注册表），
+# 只有真起一个 worker 才会暴露。新增任务模块时必须在此登记。
+include=[
+    "app.tasks.eval_tasks",
+]
+
 celery_app = Celery(
     "memory_eval_platform",
     broker=settings.redis_url,
     backend=settings.redis_url,
+    include=include,
 )
 
 celery_app.conf.update(

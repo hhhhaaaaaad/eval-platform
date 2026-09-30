@@ -22,7 +22,8 @@ from __future__ import annotations
 
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -116,6 +117,8 @@ class RunPipeline:
         self._vector_ready_timeout = vector_ready_timeout
         self._vector_ready_poll_interval = vector_ready_poll_interval
         self._sleep = sleep
+        #: 当前正在执行的阶段；异常上报靠它带出正确的阶段名（见 :meth:`_stage`）
+        self._current_stage: Stage | None = None
 
     # -- 对外入口 ---------------------------------------------------------
 
@@ -147,8 +150,10 @@ class RunPipeline:
         except PipelineFailure as exc:
             return self._fail(run, exc, completed)
         except JavaEvalError as exc:
+            # 用 self._current_stage 而不是硬编码：曾把 fencing 阶段的失败标成 search，
+            # 排障时直接把人引到错误的阶段。阶段标注错了比不标更糟。
             return self._fail(
-                run, PipelineFailure(str(exc), stage=Stage.SEARCH), completed
+                run, PipelineFailure(str(exc), stage=self._current_stage or Stage.FENCING), completed
             )
 
         return PipelineOutcome(
@@ -157,16 +162,32 @@ class RunPipeline:
 
     # -- 阶段推进 ---------------------------------------------------------
 
+    @contextmanager
+    def _stage(self, stage: Stage) -> Iterator[None]:
+        """标记当前阶段，供异常上报使用。
+
+        阶段列表只在这里出现一次——与流水线的实际顺序同源，改顺序不必改两处。
+        """
+        self._current_stage = stage
+        yield
+
     def _run_stages(self, run: Run, completed: list[str]) -> dict[str, float]:
         """按序推进各阶段；已完成的阶段可跳过（断点续跑的基础）。"""
         with self._client_factory() as client:
-            self._stage_fencing(run, client, completed)
-            self._stage_reset(run, client, completed)
-            self._stage_seed(run, client, completed)
-            self._stage_vector_ready(run, client, completed)
-            collected = self._stage_search(run, client, completed)
-            metrics = self._stage_metrics(run, collected, completed)
-            self._stage_finalize(run, client, completed, metrics)
+            with self._stage(Stage.FENCING):
+                self._stage_fencing(run, client, completed)
+            with self._stage(Stage.RESET):
+                self._stage_reset(run, client, completed)
+            with self._stage(Stage.SEED):
+                self._stage_seed(run, client, completed)
+            with self._stage(Stage.VECTOR_READY):
+                self._stage_vector_ready(run, client, completed)
+            with self._stage(Stage.SEARCH):
+                collected = self._stage_search(run, client, completed)
+            with self._stage(Stage.METRICS):
+                metrics = self._stage_metrics(run, collected, completed)
+            with self._stage(Stage.FINALIZE):
+                self._stage_finalize(run, client, completed, metrics)
         return metrics
 
     def _check_lease(self, run: Run) -> None:
@@ -420,12 +441,20 @@ class RunPipeline:
     def _fail(self, run: Run, failure: PipelineFailure, completed: list[str]) -> PipelineOutcome:
         """把失败写进 run 终态。
 
+        **顺序是刻意的：先写终态，再做「尽力而为」的清理。** 反过来写过一次出过事故——
+        「释放 fencing」抛了非 ``JavaEvalError`` 的异常（httpx 对非 ASCII 头值抛
+        ``UnicodeEncodeError``），异常从失败路径逃逸、被任务体的兜底 except 回滚，
+        于是**失败记录整条丢失**，run 卡在 pending 且没有任何痕迹。
+        先写终态意味着即便后续清理炸了，失败也已经落库、可查、可被 reaper 处理。
+
         ``should_release_fencing`` 由抛出点决定：fencing 抢占失败时为 False
         （我们没抢到，无权释放别人的），finalize 清理失败时也为 False
         （命名空间可能还脏着，见模块 docstring）。
         """
-        if failure.should_release_fencing:
-            self._release_fencing_quietly(run)
+        # 把失败的阶段也落到 run 上，而不只是写进 error_message 文本里——
+        # 「这个 run 死在哪个阶段」是可以直接查询/聚合的字段，不该只存在于一段自由文本中。
+        run.current_stage = failure.stage.value
+        self._db.flush()
 
         self._lease.finish(
             run.id, self._owner, status="failed", error_message=f"[{failure.stage.value}] {failure}"
@@ -434,6 +463,10 @@ class RunPipeline:
             "run 执行失败 stage=%s: %s", failure.stage.value, failure,
             extra={"run_id": str(run.id), "retryable": False},
         )
+
+        if failure.should_release_fencing:
+            self._release_fencing_quietly(run)
+
         return PipelineOutcome(
             run_id=run.id, status="failed", completed_stages=completed, error=str(failure)
         )
@@ -441,15 +474,21 @@ class RunPipeline:
     def _release_fencing_quietly(self, run: Run) -> None:
         """尽力释放 fencing；失败只记日志。
 
-        失败路径上再抛异常会盖掉真正的失败原因——排障时看到的是「释放失败」
-        而不是「为什么这个 run 失败了」，本末倒置。
+        捕获 ``Exception`` 而非只捕 ``JavaEvalError``：这里的目标是「绝不因为清理
+        动作本身而破坏失败记录」。放宽捕获范围的代价是可能吞掉意外异常，
+        但**此时真正的失败原因已经写进 run 了**，这里再抛只会覆盖掉它。
+        （实跑教训：只捕 JavaEvalError 时，httpx 的 UnicodeEncodeError 逃逸，
+        把整条失败路径带崩。）
         """
         try:
             with self._client_factory() as client:
                 client.release_fencing(run.eval_user_id, self._owner)
-        except JavaEvalError as exc:
+        except Exception as exc:  # noqa: BLE001 — 见 docstring：此处就是要兜住一切
             logger.warning(
-                "失败路径释放 fencing 未成功（不致命）: %s", exc, extra={"run_id": str(run.id)}
+                "失败路径释放 fencing 未成功（不致命）: %s: %s",
+                type(exc).__name__,
+                exc,
+                extra={"run_id": str(run.id)},
             )
 
 

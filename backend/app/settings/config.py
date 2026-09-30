@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     java_eval_token: str = ""
     java_eval_timeout_seconds: float = 30.0
     java_eval_max_retries: int = 3
+    # 是否让 connector 读取环境/系统代理。**默认关闭**：java_eval_base_url 是显式配置的
+    # 内部服务地址，不该被环境代理改写路由。开启的后果很隐蔽——在有代理的机器上，
+    # 访问本机 Java 服务会收到代理返回的 502，看起来像 Java 服务故障，
+    # 而请求根本没到达它（实跑时踩过：8092 无监听却报 HTTP 502）。
+    java_eval_trust_env: bool = False
 
     # AgentWrite 侧评测命名空间的取值区间，必须与其 MemoryProperties.Eval 一致：
     # baseUserId=9_000_000_000、userIdRange=1_000_000。平台派生的 eval_user_id
