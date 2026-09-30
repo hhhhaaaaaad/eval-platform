@@ -91,6 +91,53 @@ def execute_run(self, run_id: str) -> str:
         session.close()
 
 
+@celery_app.task(name="app.tasks.eval_tasks.dispatch_pending_runs")
+def dispatch_pending_runs() -> dict[str, int]:
+    """补投滞留在 pending 的 run，并给超龄的了断。
+
+    ``app.runs.dispatch`` 的 docstring 一直承诺「run 留在 pending 等待调度器补投」，
+    但那个调度器此前不存在：``reap_stale_runs`` 只处理 ``status='running'``，
+    pending 的 run 永远不会被任何人捡起。broker 丢消息或投递失败时，
+    run 会永久 pending——**并且占住 ``uq_runs_active_cfg`` 的槽位**，
+    导致同配置再也起不了新 run。
+
+    与 reaper 的区别是刻意的：reaper 处理「跑起来后失联」的 run（有租约可判断死亡），
+    这里处理「从没跑起来」的 run（没有租约，只能按时间判断）。
+
+    超龄的 run 之所以要置 failed 而不是继续重投：一个投不动的 run 重投一万次
+    也还是投不动，而它占着的并发槽位是实实在在的损失。
+    """
+    # 延迟导入：app.runs.dispatch 在模块层 import 了本模块的 execute_run，
+    # 模块级反向导入会形成循环（本模块尚未定义完 execute_run 时 dispatch 就来找它）。
+    from app.runs import dispatch as dispatch_module
+
+    session = get_session_factory()()
+    try:
+        manager = LeaseManager(session)
+        expired = manager.fail_expired_pending_runs()
+        pending = manager.select_dispatchable_pending_runs()
+        # **先提交再投递**，与 API 创建 run 时的顺序同理：反过来的话 worker 可能在
+        # 事务提交前就查这个 run，查不到。而失败记录更不能因为投递出错而回滚——
+        # 那会把「已经判定失败」的结论丢掉，让 run 回到一个更糟的中间态。
+        session.commit()
+    except Exception:
+        session.rollback()
+        logger.exception("补投扫描失败")
+        raise
+    finally:
+        session.close()
+
+    dispatched = 0
+    for run_id in pending:
+        if dispatch_module.dispatch_run(run_id):
+            dispatched += 1
+    if dispatched or expired:
+        logger.warning(
+            "补投调度：重新投递 %d 个，超龄置失败 %d 个", dispatched, len(expired)
+        )
+    return {"dispatched": dispatched, "expired": len(expired), "candidates": len(pending)}
+
+
 @celery_app.task(name="app.tasks.eval_tasks.reap_stale_runs")
 def reap_stale_runs() -> dict[str, int]:
     """定时回收心跳过期的 run（由 beat 周期触发）。

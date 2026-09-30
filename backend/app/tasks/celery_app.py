@@ -56,6 +56,15 @@ celery_app.conf.update(
             "task": "app.tasks.eval_tasks.reap_stale_runs",
             "schedule": max(10.0, get_settings().run_lease_seconds / 3),
         },
+        # pending 补投：与 reaper 同为「系统自愈」，但节奏可以更慢——
+        # reaper 对付的是卡住的在途 run（有租约兜底、影响面小），
+        # 而 pending 滞留通常是 broker 级别的故障，靠的是宽限期到达后的一次补投，
+        # 扫得再密也不会更快（宽限期才是那个约束）。
+        # 取宽限期的一半，保证一个 run 过了宽限期后最多等半个周期就被捡起。
+        "dispatch-pending-runs": {
+            "task": "app.tasks.eval_tasks.dispatch_pending_runs",
+            "schedule": max(10.0, get_settings().pending_dispatch_grace_seconds / 2),
+        },
     },
 )
 

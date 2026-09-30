@@ -92,6 +92,30 @@ WHERE status = 'running'
 RETURNING id
 """
 
+#: 可补投的 pending run：已过宽限期、且未超龄。按创建时间升序——先来先投，
+#: 避免一大批同时到期的 pending 里总是后创建的先跑。
+_SELECT_PENDING_SQL = """
+SELECT id FROM eval_runs
+WHERE status = 'pending'
+  AND created_at < now() - make_interval(secs => :grace)
+  AND created_at >= now() - make_interval(secs => :max_age)
+ORDER BY created_at
+LIMIT :batch
+"""
+
+#: 超龄 pending 置 failed。WHERE 与上面的 SELECT 互补（同一个 max_age 的两侧），
+#: 两者合起来恰好覆盖全部 pending：能投的投、投不动的了断。
+_FAIL_EXPIRED_PENDING_SQL = """
+UPDATE eval_runs
+SET status = 'failed',
+    finished_at = now(),
+    error_message = :reason,
+    updated_at = now()
+WHERE status = 'pending'
+  AND created_at < now() - make_interval(secs => :max_age)
+RETURNING id
+"""
+
 #: 僵尸回收（第二段）：重试耗尽的置 failed。
 _REAP_FAIL_SQL = """
 UPDATE eval_runs
@@ -275,6 +299,67 @@ class LeaseManager:
                 guard.acquired_at = None
                 guard.heartbeat_at = None
         self._db.flush()
+
+    # -- pending 补投 -----------------------------------------------------
+
+    def select_dispatchable_pending_runs(
+        self,
+        *,
+        grace_seconds: int | None = None,
+        max_age_seconds: int | None = None,
+        batch: int = 100,
+    ) -> tuple[uuid.UUID, ...]:
+        """挑出「可以重新投递」的 pending run。
+
+        ``dispatch.py`` 的 docstring 一直写着「run 留在 pending 等待调度器补投」，
+        但那个调度器此前并不存在——broker 一抖，run 就永久 pending。
+        这个方法就是那句话的兑现。
+
+        两个时间界限缺一不可：
+
+        - **宽限期**避免与创建时那次正常投递抢跑（见配置项注释）；
+        - **最大存活时长**是它们的死线：超龄的不该再投，而应置 failed 释放并发槽位。
+
+        ``batch`` 上限防止某次故障后积压上千个 run 时一次性全投出去——
+        那会把 broker 再打垮一次。
+        """
+        settings = get_settings()
+        grace = settings.pending_dispatch_grace_seconds if grace_seconds is None else grace_seconds
+        max_age = settings.pending_max_age_seconds if max_age_seconds is None else max_age_seconds
+
+        rows = self._db.execute(
+            text(_SELECT_PENDING_SQL),
+            {"grace": grace, "max_age": max_age, "batch": batch},
+        ).all()
+        return tuple(uuid.UUID(str(row[0])) for row in rows)
+
+    def fail_expired_pending_runs(self, *, max_age_seconds: int | None = None) -> tuple[uuid.UUID, ...]:
+        """把超龄的 pending run 置为 failed，返回被处理的 run id。
+
+        同时释放它们可能持有的独占守卫——与 reaper 同样的理由：守卫指着一条
+        永不会再跑的 run，会让所有后续独占 run 一直吃 409。
+        """
+        max_age = (
+            get_settings().pending_max_age_seconds
+            if max_age_seconds is None
+            else max_age_seconds
+        )
+        reason = (
+            f"pending 超过 {max_age}s 未能投递，已由调度器判定失败"
+            f"（broker 长期不可用或任务被反复丢弃）"
+        )
+        expired = tuple(
+            uuid.UUID(str(row[0]))
+            for row in self._db.execute(
+                text(_FAIL_EXPIRED_PENDING_SQL), {"max_age": max_age, "reason": reason}
+            ).all()
+        )
+        if expired:
+            self._release_guards_for(expired)
+            # 这是「系统自愈」事件，不告警的话 broker 故障会被静默消化，
+            # 表现为「有些 run 莫名其妙 failed」而没人知道根因在基础设施。
+            logger.warning("补投调度器判定 %d 个 pending run 超龄失败", len(expired))
+        return expired
 
     # -- 只读辅助 ---------------------------------------------------------
 

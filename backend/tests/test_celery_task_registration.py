@@ -30,6 +30,8 @@ TASKS_PACKAGE = Path(celery_app_module.__file__).parent
 EXPECTED_TASKS = (
     "app.tasks.eval_tasks.execute_run",
     "app.tasks.eval_tasks.reap_stale_runs",
+    # pending 补投：与 reaper 同为兜底任务，漏注册的后果同样是「没有任何进程会来收拾」。
+    "app.tasks.eval_tasks.dispatch_pending_runs",
     "app.tasks.celery_app.ping",
 )
 

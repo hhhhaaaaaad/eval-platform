@@ -405,3 +405,121 @@ class TestHelpers:
 
     def test_get_run_returns_none_for_unknown(self, db: Session) -> None:
         assert LeaseManager(db).get_run(uuid.uuid4()) is None
+
+
+# ---------------------------------------------------------------------------
+# pending 补投（P1-A4）
+#
+# 这一组的存在理由：`dispatch.py` 的 docstring 长期承诺「run 留在 pending 等待
+# 调度器补投」，而调度器并不存在——reaper 只处理 status='running'。
+# broker 丢消息时，run 会永久 pending **并占住 uq_runs_active_cfg 的槽位**，
+# 那套配置从此起不了新 run。下面用「把 created_at 推到过去」来模拟滞留，
+# 不必真的等宽限期。
+# ---------------------------------------------------------------------------
+
+
+def _age_run(db: Session, run_id: uuid.UUID, *, seconds_ago: int) -> None:
+    """把创建时间推到过去，模拟 run 已经滞留了这么久。"""
+    db.execute(
+        text("UPDATE eval_runs SET created_at = now() - make_interval(secs => :s) WHERE id = :id"),
+        {"s": seconds_ago, "id": str(run_id)},
+    )
+    db.flush()
+
+
+# 注意：补投调度器**按设计就是全库范围的**（它扫的是「所有滞留在 pending 的 run」，
+# 不是某一个用例的 run）。因此这里的断言一律用「本用例的 run 是否在其中」，
+# 而不是断言整个返回值等于某个元组——后者在开发库里存有历史遗留 pending run 时
+# 必然失败，且失败原因与被测逻辑毫无关系。
+
+
+class TestPendingRedispatch:
+    def test_fresh_pending_is_not_selected(self, db: Session, run_id: uuid.UUID) -> None:
+        """刚落库的 pending 不该被补投——那会和创建时那次正常投递抢跑。"""
+        selected = LeaseManager(db).select_dispatchable_pending_runs()
+        assert run_id not in selected
+
+    def test_pending_past_grace_is_selected(self, db: Session, run_id: uuid.UUID) -> None:
+        _age_run(db, run_id, seconds_ago=120)
+
+        selected = LeaseManager(db).select_dispatchable_pending_runs(
+            grace_seconds=60, max_age_seconds=3600
+        )
+        assert run_id in selected
+
+    def test_running_run_is_never_selected(self, db: Session, run_id: uuid.UUID) -> None:
+        """补投只针对 pending：已跑起来的归 reaper 管（它有租约可以判断死亡）。"""
+        lease = LeaseManager(db)
+        _age_run(db, run_id, seconds_ago=120)
+        lease.claim(run_id, "worker-1")
+        db.flush()
+
+        assert run_id not in lease.select_dispatchable_pending_runs(grace_seconds=60)
+
+    def test_expired_pending_is_failed_with_reason(self, db: Session, run_id: uuid.UUID) -> None:
+        """超龄的 pending 要有了断，否则它会永远占着并发槽位。"""
+        _age_run(db, run_id, seconds_ago=7200)
+
+        expired = LeaseManager(db).fail_expired_pending_runs(max_age_seconds=3600)
+
+        assert run_id in expired
+        row = _reload(db, run_id)
+        assert row.status == "failed"
+        assert row.finished_at is not None
+        assert "3600" in (row.error_message or ""), "错误信息要能说明是按哪个阈值判的"
+
+    def test_expired_pending_frees_the_config_slot(
+        self, db: Session, run_id: uuid.UUID
+    ) -> None:
+        """**这是补投调度器最重要的作用**：把并发槽位还回去。
+
+        滞留的 pending run 会一直占着 ``uq_runs_active_cfg``，同配置的新 run 全部 409。
+        不给了断的话，那套配置就永久废了，而且没人知道原因。
+        """
+        run = _reload(db, run_id)
+        _age_run(db, run_id, seconds_ago=7200)
+        LeaseManager(db).fail_expired_pending_runs(max_age_seconds=3600)
+        db.flush()
+
+        # 同一个配置指纹 + 同一个 case_limit，此时应当能再建一个 run。
+        again, created = RunService(db).create_run(
+            RunCreateRequest(
+                dataset_version_id=run.dataset_version_id,
+                param_snapshot_id=run.param_snapshot_id,
+                model_version_id=run.model_version_id,
+                mode=run.mode,
+                case_limit=run.case_limit,
+            ),
+            created_by=None,
+        )
+        assert created is True
+        assert again.id != run_id
+
+    def test_selection_is_capped_by_batch(self, db: Session, run_id: uuid.UUID) -> None:
+        """有上限——故障恢复时积压上千个 run，一次全投会把 broker 再打垮一次。
+
+        为了造出第二个**可以并存**的 pending run，这里给它一个不同的 case_limit：
+        case_limit 参与 config_fingerprint，因此两个 run 不撞 ``uq_runs_active_cfg``。
+        （这一点本身也说明那个指纹改动是必要的——否则连这种测试都写不出来。）
+        """
+        run = _reload(db, run_id)
+        second, _ = RunService(db).create_run(
+            RunCreateRequest(
+                dataset_version_id=run.dataset_version_id,
+                param_snapshot_id=run.param_snapshot_id,
+                model_version_id=run.model_version_id,
+                mode=run.mode,
+                case_limit=1,
+            ),
+            created_by=None,
+        )
+        _age_run(db, run_id, seconds_ago=120)
+        _age_run(db, second.id, seconds_ago=120)
+        db.flush()
+
+        lease = LeaseManager(db)
+        both = lease.select_dispatchable_pending_runs(grace_seconds=60, batch=100)
+        assert {run_id, second.id} <= set(both)
+
+        # LIMIT 必须生效：无论全库有多少个可投的 run，batch=1 都只能返回一条。
+        assert len(lease.select_dispatchable_pending_runs(grace_seconds=60, batch=1)) == 1

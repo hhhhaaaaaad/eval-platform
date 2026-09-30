@@ -69,6 +69,21 @@ class Settings(BaseSettings):
     # pending 重新排队；耗尽则置 failed，避免坏 run 无限占用调度。
     run_max_retries: int = 3
 
+    # 补投调度器的宽限期（秒）：pending 超过这个时长的 run 才会被重新投递。
+    # **必须留宽限期**，否则会和「创建时那次正常投递」抢跑——run 刚落库、任务还在
+    # broker 里排队，调度器就已经把它再投一遍。重复投递本身不致命
+    # （execute_run 的租约领取是 CAS，第二个 worker 会拿到 claimed=False 直接退出），
+    # 但每次都白跑一遍任务体，日志里全是无意义的「未被本 worker 领取」。
+    pending_dispatch_grace_seconds: int = 60
+
+    # pending run 的最大存活时长（秒）：超过它的 pending run 直接置 failed。
+    #
+    # **这条不是为了省资源，而是为了解锁并发**：pending 的 run 会占住
+    # ``uq_runs_active_cfg`` 的槽位——只要它在 pending 状态待着，同配置的新 run
+    # 一律 409。broker 长时间不可用时，如果不给它一个了断，
+    # 那套配置就永远起不了新 run，且没人会知道原因。
+    pending_max_age_seconds: int = 3600
+
     # 默认值仅用于本地开发，生产必须用环境变量覆盖。
     # 长度须 >= 32 字节：短于 32 字节时 PyJWT 会发 InsecureKeyLengthWarning
     # （RFC 7518 §3.2），且密钥过短会显著削弱 HS256 的抗暴力破解能力。
