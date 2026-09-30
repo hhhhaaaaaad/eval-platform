@@ -42,6 +42,23 @@ class Settings(BaseSettings):
     java_eval_timeout_seconds: float = 30.0
     java_eval_max_retries: int = 3
 
+    # AgentWrite 侧评测命名空间的取值区间，必须与其 MemoryProperties.Eval 一致：
+    # baseUserId=9_000_000_000、userIdRange=1_000_000。平台派生的 eval_user_id
+    # 必须落在这个区间内，否则 Java 端会以 E0403 拒绝（命名空间越界）。
+    # 这两个值**不在 /eval/params 里**（那是检索/注入参数，不是安全边界），
+    # 故只能配置；改 Java 侧配置时这里必须同步。
+    eval_user_id_base: int = 9_000_000_000
+    eval_user_id_range: int = 1_000_000
+
+    # 创建 run 后是否投递 Celery 任务。本地无 broker 时可关掉；
+    # 关闭不会丢 run——pending 状态的 run 可由调度器补投（idx_runs_pending 即为此存在）。
+    enqueue_runs: bool = True
+
+    # 独占守卫的失效阈值：持锁 run 超过这个时长未更新心跳，视为已死、允许接管。
+    # 与租约心跳（EP-7 的 reaper）刻意共用同一个值——两处用不同阈值会导致
+    # 「reaper 认为它还活着、守卫认为它可以被抢」这种互相矛盾的判断。
+    exclusive_guard_stale_seconds: int = 300
+
     # 默认值仅用于本地开发，生产必须用环境变量覆盖。
     # 长度须 >= 32 字节：短于 32 字节时 PyJWT 会发 InsecureKeyLengthWarning
     # （RFC 7518 §3.2），且密钥过短会显著削弱 HS256 的抗暴力破解能力。

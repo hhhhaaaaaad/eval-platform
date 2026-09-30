@@ -16,6 +16,7 @@ from app.api.health import router as health_router
 from app.auth.api import router as auth_router
 from app.datasets.api import router as datasets_router
 from app.params.api import router as params_router
+from app.runs.api import router as runs_router
 from app.settings.config import get_settings
 from app.settings.logging import RequestIdMiddleware, configure_logging, get_logger
 
@@ -50,6 +51,7 @@ def create_app() -> FastAPI:
     app.include_router(auth_router, prefix="/api/v1")
     app.include_router(datasets_router, prefix="/api/v1")
     app.include_router(params_router, prefix="/api/v1")
+    app.include_router(runs_router, prefix="/api/v1")
     return app
 
 
