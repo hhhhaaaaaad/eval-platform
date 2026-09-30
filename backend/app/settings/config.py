@@ -76,6 +76,17 @@ class Settings(BaseSettings):
     # 但每次都白跑一遍任务体，日志里全是无意义的「未被本 worker 领取」。
     pending_dispatch_grace_seconds: int = 60
 
+    # 抽取维度的「低价值写入」置信度阈值。
+    #
+    # **这是平台侧的口径决策，不是 AgentWrite 的配置**，因此不放进参数快照
+    # （快照冻结的是被评测系统的配置，而这个阈值是评测方「怎么算低价值」的判断）。
+    # 它会被记进该维度结果的 detail，换阈值后指标不可直接比较、但至少能看出用的是哪个。
+    #
+    # 0.5 的含义是「低于抛硬币的把握」——这类候选正是人工复核最该先看的那批。
+    # 注：AgentWrite 侧的幻觉抽检取样区间是 [0.8, 0.9]，那是「抽哪些样本去查」，
+    # 与「哪些算低价值」是两个问题，不必对齐。
+    extraction_confidence_threshold: float = 0.5
+
     # pending run 的最大存活时长（秒）：超过它的 pending run 直接置 failed。
     #
     # **这条不是为了省资源，而是为了解锁并发**：pending 的 run 会占住

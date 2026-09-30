@@ -46,6 +46,7 @@ logger = get_logger(__name__)
 DIMENSION_RETRIEVAL = "retrieval"
 DIMENSION_INJECTION = "injection"
 DIMENSION_GOVERNANCE = "governance"
+DIMENSION_EXTRACTION = "extraction"
 
 
 def _to_decimal(value: float, *, where: str) -> Decimal:

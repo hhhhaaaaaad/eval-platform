@@ -44,8 +44,13 @@ from sqlalchemy.orm import Session
 
 from app.connector import JavaEvalClient, JavaEvalError
 from app.connector.schemas import SeedItem
-from app.datasets.digest import CASE_TYPE_GOVERNANCE, CASE_TYPE_QUERY_TO_MEMORY
+from app.datasets.digest import (
+    CASE_TYPE_CONVERSATION_TO_MEMORY,
+    CASE_TYPE_GOVERNANCE,
+    CASE_TYPE_QUERY_TO_MEMORY,
+)
 from app.datasets.models import Case, DatasetVersion
+from app.engine.dimensions.extraction import ExtractedCandidate, ExtractionEvaluator
 from app.engine.dimensions.governance import (
     GOVERNANCE_TASKS,
     GovernanceEvaluator,
@@ -59,6 +64,7 @@ from app.engine.dimensions.retrieval import (
 )
 from app.params.models import ParamSnapshot
 from app.results import (
+    DIMENSION_EXTRACTION,
     DIMENSION_GOVERNANCE,
     DIMENSION_INJECTION,
     DIMENSION_RETRIEVAL,
@@ -67,6 +73,7 @@ from app.results import (
 )
 from app.runs.lease import LeaseManager
 from app.runs.models import Run
+from app.settings.config import get_settings
 from app.settings.logging import get_logger
 
 logger = get_logger(__name__)
@@ -82,6 +89,7 @@ class Stage(str, Enum):
     SEARCH = "search"
     INJECTION = "injection"
     GOVERNANCE = "governance"
+    EXTRACTION = "extraction"
     METRICS = "metrics"
     FINALIZE = "finalize"
 
@@ -221,8 +229,12 @@ class RunPipeline:
                 injected = self._stage_injection(run, client, completed)
             with self._stage(Stage.GOVERNANCE):
                 governed = self._stage_governance(run, client, completed)
+            with self._stage(Stage.EXTRACTION):
+                extracted = self._stage_extraction(run, client, completed)
             with self._stage(Stage.METRICS):
-                metrics = self._stage_metrics(run, collected, injected, governed, completed)
+                metrics = self._stage_metrics(
+                    run, collected, injected, governed, extracted, completed
+                )
             with self._stage(Stage.FINALIZE):
                 self._stage_finalize(run, client, completed, metrics)
         return metrics
@@ -482,7 +494,25 @@ class RunPipeline:
                 .order_by(Case.id)
             ).scalars()
         )
-        return self._apply_case_limit(run, cases)
+        return self._apply_case_limit(run, cases, case_type=CASE_TYPE_QUERY_TO_MEMORY)
+
+    def _extraction_cases(self, run: Run) -> list[Case]:
+        """本 run 要评测的抽取 case（对话 → 期望记忆）。
+
+        **受 case_limit 约束，而且这里最需要它**：抽取维度每条 case 要调一次 LLM，
+        是四个维度里唯一「慢且花钱」的。别的维度省下的是毫秒，这里省下的是分钟和真金白银。
+        """
+        cases = list(
+            self._db.execute(
+                select(Case)
+                .where(
+                    Case.dataset_version_id == run.dataset_version_id,
+                    Case.case_type == CASE_TYPE_CONVERSATION_TO_MEMORY,
+                )
+                .order_by(Case.id)
+            ).scalars()
+        )
+        return self._apply_case_limit(run, cases, case_type=CASE_TYPE_CONVERSATION_TO_MEMORY)
 
     def _governance_cases(self, run: Run) -> list[Case]:
         """本 run 要评测的治理 case。
@@ -504,29 +534,30 @@ class RunPipeline:
             ).scalars()
         )
 
-    def _apply_case_limit(self, run: Run, cases: list[Case]) -> list[Case]:
-        """按 ``run.case_limit`` 截断取数范围。
+    def _apply_case_limit(self, run: Run, cases: list[Case], *, case_type: str) -> list[Case]:
+        """按 ``run.case_limit`` 截断取数范围，并把取数情况记进 checkpoint。
 
-        **截断放在 search 之前，而不是算完指标再丢弃**：限量跑的全部意义是省时间，
-        而时间几乎全花在逐 case 的检索调用上——先跑 1000 条再取前 10 条，
-        省下的是零。这也是为什么 case_limit 是刚需：抽取维度每条 case 要调一次 LLM。
+        **截断放在调用接口之前，而不是算完指标再丢弃**：限量跑的全部意义是省时间，
+        而时间几乎全花在逐 case 的接口调用上——先跑 1000 条再取前 10 条，省下的是零。
 
-        记录实际取到的条数到 checkpoint：``case_limit=10`` 而数据集只有 3 条时，
-        指标是基于 3 条算的——这个差异必须能看出来，否则趋势图上会莫名其妙地跳。
+        **记录按 case_type 分组，不能用扁平键**：同一个 run 里 query case 与
+        conversation case 各自限量，扁平键（``cases_selected``）会被后一次调用覆盖，
+        于是 checkpoint 上只剩下最后一种类型的数字，看的人会以为那是对整体的统计。
+        ``case_limit=10`` 而数据集只有 3 条时，指标是基于 3 条算的——这个差异
+        必须能看出来，否则趋势图上会莫名其妙地跳。
         """
         limited = cases if run.case_limit is None else cases[: run.case_limit]
         if run.case_limit is not None and len(limited) != run.case_limit:
             logger.info(
-                "case_limit=%s 大于可用 case 数，实际取 %d 条",
+                "case_limit=%s 大于可用的 %s case 数，实际取 %d 条",
                 run.case_limit,
+                case_type,
                 len(limited),
                 extra={"run_id": str(run.id)},
             )
-        run.checkpoint = {
-            **run.checkpoint,
-            "cases_available": len(cases),
-            "cases_selected": len(limited),
-        }
+        selection = dict(run.checkpoint.get("case_selection") or {})
+        selection[case_type] = {"available": len(cases), "selected": len(limited)}
+        run.checkpoint = {**run.checkpoint, "case_selection": selection}
         self._db.flush()
         return limited
 
@@ -625,12 +656,48 @@ class RunPipeline:
         self._mark_stage(run, completed, Stage.GOVERNANCE)
         return collected
 
+    def _stage_extraction(
+        self, run: Run, client: JavaEvalClient, completed: list[str]
+    ) -> list[tuple[Case, list[ExtractedCandidate]]]:
+        """对每个对话 case 跑一次 ``extract``，收集抽取出的候选。
+
+        **这是四个维度里唯一「慢且花钱」的**：每条 case 一次 LLM 调用。
+        Java 侧该端点是只读的（注释明确写着「仅返回候选列表，不落库」），
+        因此不需要 fencing 头，也不会污染命名空间——它只是在读一段对话然后让 LLM 抽。
+        """
+        if Stage.EXTRACTION.value in completed:
+            return []
+        self._check_lease(run)
+
+        cases = self._extraction_cases(run)
+        if not cases:
+            logger.info("无对话 case，跳过抽取维度", extra={"run_id": str(run.id)})
+            self._mark_stage(run, completed, Stage.EXTRACTION)
+            return []
+
+        collected: list[tuple[Case, list[ExtractedCandidate]]] = []
+        for case in cases:
+            self._check_lease(run)
+            candidates = client.extract(
+                run.eval_user_id, list(case.payload.get("messages") or [])
+            )
+            collected.append(
+                (
+                    case,
+                    [ExtractedCandidate.from_connector_candidate(item) for item in candidates],
+                )
+            )
+        logger.info("抽取观测完成: %d 个 case", len(collected), extra={"run_id": str(run.id)})
+        self._mark_stage(run, completed, Stage.EXTRACTION)
+        return collected
+
     def _stage_metrics(
         self,
         run: Run,
         collected: list[tuple[Case, list[RetrievedItem]]],
         injected: list[tuple[Case, int, list[str]]],
         governed: list[tuple[Case, list[Any]]],
+        extracted: list[tuple[Case, list[ExtractedCandidate]]],
         completed: list[str],
     ) -> dict[str, dict[str, float]]:
         """算各维度指标并落库。此阶段不碰网络，纯计算。"""
@@ -719,6 +786,37 @@ class RunPipeline:
                 (
                     (case.id, result.as_metric_values(), result.as_detail())
                     for (case, _), result in zip(governed, governance_results, strict=True)
+                ),
+            )
+
+        if extracted:
+            # 阈值取自平台配置而非 AgentWrite 的参数快照：它刻画的不是「被评测系统怎么配的」，
+            # 而是「评测方认为多低算低价值」——换了阈值指标不可直接比较，
+            # 因此写进 detail，让看指标的人知道这一批是用什么标准算出来的。
+            extraction_evaluator = ExtractionEvaluator(
+                confidence_threshold=get_settings().extraction_confidence_threshold
+            )
+            extraction_results = [
+                extraction_evaluator.evaluate_case(
+                    payload=case.payload, ground_truth=case.ground_truth, candidates=candidates
+                )
+                for case, candidates in extracted
+            ]
+            by_dimension[DIMENSION_EXTRACTION] = extraction_evaluator.aggregate(
+                extraction_results
+            )
+            writer.write_dimension_metrics(
+                run.id,
+                DIMENSION_EXTRACTION,
+                by_dimension[DIMENSION_EXTRACTION],
+                detail={"confidence_threshold": extraction_evaluator.confidence_threshold},
+            )
+            writer.write_case_metrics(
+                run.id,
+                DIMENSION_EXTRACTION,
+                (
+                    (case.id, result.as_metric_values(), result.as_detail())
+                    for (case, _), result in zip(extracted, extraction_results, strict=True)
                 ),
             )
 

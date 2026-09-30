@@ -167,6 +167,9 @@ class _JavaStub:
         #: ``{task: [决策...]}``，按 replay 请求里唯一为真的开关取。
         self.replay_by_task: dict[str, list[dict]] = {}
         self.replay_tasks: list[str | None] = []
+        self.extract_requests: list[dict] = []
+        #: ``extract`` 返回的候选（每条 case 相同），字段名用 connector 的 camelCase 别名。
+        self.extract_candidates: list[dict] = []
 
     def _count(self, name: str) -> None:
         self.calls[name] = self.calls.get(name, 0) + 1
@@ -185,6 +188,7 @@ class _JavaStub:
         respx.post(_url("/api/v1/eval/governance/replay")).mock(
             side_effect=self._governance_replay
         )
+        respx.post(_url("/api/v1/eval/extract")).mock(side_effect=self._extract)
 
     # -- 各端点 ----------------------------------------------------------
 
@@ -252,6 +256,11 @@ class _JavaStub:
                 }
             ),
         )
+
+    def _extract(self, request: httpx.Request) -> httpx.Response:
+        self._count("extract")
+        self.extract_requests.append(json.loads(request.content))
+        return httpx.Response(200, json=_envelope(data=self.extract_candidates))
 
     def _governance_replay(self, request: httpx.Request) -> httpx.Response:
         self._count("governance_replay")
@@ -350,6 +359,7 @@ def test_happy_path_succeeds_and_computes_metrics(
         "search",
         "injection",
         "governance",
+        "extraction",
         "metrics",
         "finalize",
     ]
@@ -607,14 +617,16 @@ def test_case_limit_records_selected_and_available(
 
     看不出来的后果很具体：``case_limit=10`` 而数据集只有 3 条时，指标是基于 3 条算的，
     趋势图上会出现无法解释的跳变，而没有任何地方能指出原因。
+
+    记录**按 case_type 分组**：一个 run 里 query case 与 conversation case 各自限量，
+    扁平键会被后一次调用覆盖，看的人会以为那个数字是对整体的统计。
     """
     java.install()
     _pipeline(db, monkeypatch).execute(limited_run_id)
     db.commit()
 
-    checkpoint = _reload(db, limited_run_id).checkpoint
-    assert checkpoint["cases_available"] == 2
-    assert checkpoint["cases_selected"] == 1
+    selection = _reload(db, limited_run_id).checkpoint["case_selection"]
+    assert selection["query_to_memory"] == {"available": 2, "selected": 1}
 
 
 def test_case_limit_separates_fingerprint_and_namespace(
@@ -1232,3 +1244,121 @@ def test_failure_stage_is_labelled_with_actual_stage(
     assert run.current_stage == "fencing"
     assert "[fencing]" in (run.error_message or "")
     assert "search" not in (run.error_message or "")
+
+
+@respx.mock
+def test_extraction_dimension_is_evaluated_and_persisted(
+    db: Session, java: _JavaStub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """抽取维度接线：调一次 extract、算 P/R/F1 与三个比率、落库。
+
+    造的数据刻意是「抽对了一条、多抽了一条低置信度的」：
+    这样 precision（0.5 而非 1.0）、低价值写入率（0.5）与 F1 都不是平凡值，
+    接线若把参数接反（比如把候选当成 ground truth）会立刻体现出来。
+    """
+    suffix = uuid.uuid4().hex[:8]
+    dataset_id = db.execute(
+        text("INSERT INTO eval_datasets(name) VALUES (:n) RETURNING id"),
+        {"n": f"ext-{suffix}"},
+    ).scalar_one()
+    version_id = db.execute(
+        text(
+            "INSERT INTO eval_dataset_versions(dataset_id, version, schema_version, source, "
+            "content_digest) VALUES (:d, 'v1', 1, 'cli', :digest) RETURNING id"
+        ),
+        {"d": dataset_id, "digest": f"sha256:{uuid.uuid4().hex}"},
+    ).scalar_one()
+    db.execute(
+        text(
+            "INSERT INTO eval_cases(dataset_version_id, case_type, group_key, content_hash, "
+            "payload, ground_truth) VALUES "
+            "(:v, 'conversation_to_memory', 'dialogue', :h, CAST(:p AS jsonb), CAST(:g AS jsonb))"
+        ),
+        {
+            "v": version_id,
+            "h": f"sha256:{uuid.uuid4().hex}",
+            "p": json.dumps(
+                {
+                    "dialogue_id": "d0",
+                    "messages": [{"role": "user", "content": "我在用 Java 17 写后端"}],
+                },
+                ensure_ascii=False,
+            ),
+            "g": json.dumps(
+                {
+                    "ground_truth_memories": [
+                        {"content": "用户用 Java 17", "type": "fact", "attributed_to": "user"}
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+        },
+    )
+    snapshot, _ = ParamService(db).get_or_create_param_snapshot(
+        name=f"ext-snap-{suffix}",
+        params={
+            "vector_store": f"ext-{suffix}",
+            "rrf_k": 60,
+            "alpha": 0.5,
+            "beta": 0.3,
+            "recency_half_life_days": 14.0,
+            "profile_boost": 0.2,
+            "min_confidence": 0.4,
+            "inject_max_tokens": 2000,
+        },
+    )
+    model, _ = ParamService(db).get_or_create_model_version(
+        embedding_model_id=f"ext-emb-{suffix}", reranker_model_id=f"ext-rr-{suffix}"
+    )
+    run, _ = RunService(db).create_run(
+        RunCreateRequest(
+            dataset_version_id=version_id,
+            param_snapshot_id=snapshot.id,
+            model_version_id=model.id,
+            mode="exact",
+        ),
+        created_by=None,
+    )
+    db.commit()
+
+    java.extract_candidates = [
+        # 命中且归属正确、置信度高
+        {"content": "用户用 Java 17", "type": "fact", "attributedTo": "user", "confidence": 0.9},
+        # 多抽：不在 ground truth 里，且置信度低于默认阈值 0.5
+        {"content": "用户喜欢咖啡", "type": "preference", "attributedTo": "user", "confidence": 0.2},
+    ]
+    java.install()
+    outcome = _pipeline(db, monkeypatch).execute(run.id)
+    db.commit()
+
+    assert outcome.status == "succeeded"
+    assert java.calls["extract"] == 1, "每个对话 case 一次 LLM 调用"
+
+    extraction = outcome.metrics["extraction"]
+    assert extraction["case_count_scored"] == 1.0
+    assert extraction["precision"] == pytest.approx(0.5), "抽了两条、命中一条"
+    assert extraction["recall"] == pytest.approx(1.0)
+    assert extraction["f1"] == pytest.approx(2 * 0.5 * 1.0 / 1.5)
+    assert extraction["attribution_error_rate"] == pytest.approx(0.0)
+    assert extraction["duplicate_extraction_rate"] == pytest.approx(0.0)
+    assert extraction["low_value_write_rate"] == pytest.approx(0.5), "0.2 < 阈值 0.5"
+
+    # 阈值要记进明细：不同阈值算出的低价值率不可直接比较，看指标的人必须知道用的是哪个
+    detail = db.execute(
+        text(
+            "SELECT detail FROM eval_run_results "
+            "WHERE run_id = :r AND dimension = 'extraction' LIMIT 1"
+        ),
+        {"r": str(run.id)},
+    ).scalar_one()
+    assert detail["confidence_threshold"] == pytest.approx(0.5)
+
+    db.execute(text("DELETE FROM eval_run_results WHERE run_id = :r"), {"r": str(run.id)})
+    db.execute(text("DELETE FROM eval_case_results WHERE run_id = :r"), {"r": str(run.id)})
+    db.execute(text("DELETE FROM eval_runs WHERE id = :r"), {"r": str(run.id)})
+    db.execute(text("DELETE FROM eval_cases WHERE dataset_version_id = :v"), {"v": version_id})
+    db.execute(text("DELETE FROM eval_dataset_versions WHERE id = :v"), {"v": version_id})
+    db.execute(text("DELETE FROM eval_datasets WHERE id = :d"), {"d": dataset_id})
+    db.execute(text("DELETE FROM eval_param_snapshots WHERE id = :s"), {"s": snapshot.id})
+    db.execute(text("DELETE FROM eval_model_versions WHERE id = :m"), {"m": model.id})
+    db.commit()
