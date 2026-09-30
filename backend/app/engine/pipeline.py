@@ -39,6 +39,7 @@ from app.engine.dimensions.retrieval import (
     RetrievalEvaluator,
     RetrievedItem,
 )
+from app.results import DIMENSION_RETRIEVAL, ResultReader, ResultWriter
 from app.runs.lease import LeaseManager
 from app.runs.models import Run
 from app.settings.logging import get_logger
@@ -338,9 +339,14 @@ class RunPipeline:
                 select(Case).where(
                     Case.dataset_version_id == run.dataset_version_id,
                     Case.case_type == "query_to_memory",
-                )
+                    # 排序是**截断正确性的前提**：没有 ORDER BY 时 PostgreSQL 返回行的
+                    # 顺序不保证稳定（并发插入、vacuum、计划切换都会改变它），
+                    # 于是「限量 10 条」两次跑到的可能是不同的 10 条——指标不可复现，
+                    # 而这正是本平台最不能出的问题。按 id 排序给出一个确定且便宜的序。
+                ).order_by(Case.id)
             ).scalars()
         ]
+        cases = self._apply_case_limit(run, cases)
 
         collected: list[tuple[Case, list[RetrievedItem]]] = []
         for case in cases:
@@ -363,15 +369,44 @@ class RunPipeline:
         self._mark_stage(run, completed, Stage.SEARCH)
         return collected
 
+    def _apply_case_limit(self, run: Run, cases: list[Case]) -> list[Case]:
+        """按 ``run.case_limit`` 截断取数范围。
+
+        **截断放在 search 之前，而不是算完指标再丢弃**：限量跑的全部意义是省时间，
+        而时间几乎全花在逐 case 的检索调用上——先跑 1000 条再取前 10 条，
+        省下的是零。这也是为什么 case_limit 是刚需：抽取维度每条 case 要调一次 LLM。
+
+        记录实际取到的条数到 checkpoint：``case_limit=10`` 而数据集只有 3 条时，
+        指标是基于 3 条算的——这个差异必须能看出来，否则趋势图上会莫名其妙地跳。
+        """
+        limited = cases if run.case_limit is None else cases[: run.case_limit]
+        if run.case_limit is not None and len(limited) != run.case_limit:
+            logger.info(
+                "case_limit=%s 大于可用 case 数，实际取 %d 条",
+                run.case_limit,
+                len(limited),
+                extra={"run_id": str(run.id)},
+            )
+        run.checkpoint = {
+            **run.checkpoint,
+            "cases_available": len(cases),
+            "cases_selected": len(limited),
+        }
+        self._db.flush()
+        return limited
+
     def _stage_metrics(
         self,
         run: Run,
         collected: list[tuple[Case, list[RetrievedItem]]],
         completed: list[str],
     ) -> dict[str, float]:
-        """算指标。此阶段不碰网络，纯计算。"""
+        """算指标 → 落库。此阶段不碰网络，纯计算。"""
         if Stage.METRICS.value in completed:
-            return {}
+            # 断点续跑：指标已经算过并落库了，从库里读回来而不是返回空字典。
+            # 返回空字典会让 finalize 把 result_summary 写成 {"retrieval": {}}，
+            # 于是一个「续跑成功」的 run 在 API 上看起来像「什么都没算出来」。
+            return ResultReader(self._db).dimension_metrics(run.id, DIMENSION_RETRIEVAL)
 
         results: list[RetrievalCaseResult] = [
             self._evaluator.evaluate_case(
@@ -381,8 +416,12 @@ class RunPipeline:
         ]
         metrics = self._evaluator.aggregate(results)
 
-        # case 明细落库，满足「每个指标可以追溯到 case detail」。
-        # 用 checkpoint 承载（本轮不新增表）；条目数上限防止 checkpoint 无限膨胀。
+        self._persist_metrics(run, collected, results, metrics)
+
+        # checkpoint 里仍留一份截断明细：它是「run 对象自带的一眼可见视图」，
+        # 便于只看一个 run 的 JSON 就能判断发生了什么的场景（含 case 数超限标记）。
+        # **权威存储在 eval_run_results / eval_case_results**，趋势查询与逐条追溯
+        # 都走那两张表——JSONB 上做跨 run 聚合不可行。
         run.checkpoint = {
             **run.checkpoint,
             "case_details": [result.as_detail() for result in results[:200]],
@@ -393,6 +432,35 @@ class RunPipeline:
 
         self._mark_stage(run, completed, Stage.METRICS)
         return metrics
+
+    def _persist_metrics(
+        self,
+        run: Run,
+        collected: list[tuple[Case, list[RetrievedItem]]],
+        results: list[RetrievalCaseResult],
+        metrics: dict[str, float],
+    ) -> None:
+        """把维度级聚合与逐 case 明细写进结果表。
+
+        ``collected`` 与 ``results`` 是**位置一一对应**的（同一列表推导产生），
+        用 ``zip`` 关联而非按 query_id 查表：query_id 允许重复（schema 只要求非空），
+        按它关联会在重复时静默错配到错误的那条 case。
+        """
+        writer = ResultWriter(self._db)
+        writer.write_dimension_metrics(
+            run.id,
+            DIMENSION_RETRIEVAL,
+            metrics,
+            detail={"match_mode": results[0].match_mode if results else None},
+        )
+        writer.write_case_metrics(
+            run.id,
+            DIMENSION_RETRIEVAL,
+            (
+                (case.id, result.as_metric_values(), result.as_detail())
+                for (case, _), result in zip(collected, results, strict=True)
+            ),
+        )
 
     def _stage_finalize(
         self,

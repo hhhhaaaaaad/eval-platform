@@ -139,6 +139,7 @@ class RunService:
             model_version_id=payload.model_version_id,
             dataset_version_id=payload.dataset_version_id,
             mode=payload.mode,
+            case_limit=payload.case_limit,
         )
         fingerprint = components["config_fingerprint"]
         eval_user_id = derive_eval_user_id(fingerprint)
@@ -161,7 +162,10 @@ class RunService:
             mode=payload.mode,
             status="pending",
             exclusive=payload.exclusive,
-            checkpoint={"completed_stages": [], "case_limit": payload.case_limit},
+            # case_limit 进独立列而不是 checkpoint：它参与指纹、决定并发分组，
+            # 是 run 的配置而非进度标记（详见 Run.case_limit 的注释）。
+            case_limit=payload.case_limit,
+            checkpoint={"completed_stages": []},
             created_by=created_by,
         )
         self._db.add(run)

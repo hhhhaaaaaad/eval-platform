@@ -185,6 +185,18 @@ def cleanup(
                      "acquired_at = NULL, heartbeat_at = NULL WHERE exclusive_owner = :r"),
                 {"r": run_id},
             )
+        # 结果表必须最先删：它们以 ON DELETE RESTRICT 引用 eval_runs / eval_cases
+        # （刻意的——有结果的跑批不该被误删）。顺序错了会撞 ForeignKeyViolation。
+        session.execute(
+            text("DELETE FROM eval_run_results WHERE run_id IN "
+                 "(SELECT id FROM eval_runs WHERE dataset_version_id = :v)"),
+            {"v": dataset_version_id},
+        )
+        session.execute(
+            text("DELETE FROM eval_case_results WHERE run_id IN "
+                 "(SELECT id FROM eval_runs WHERE dataset_version_id = :v)"),
+            {"v": dataset_version_id},
+        )
         session.execute(
             text("DELETE FROM eval_runs WHERE dataset_version_id = :v"), {"v": dataset_version_id}
         )

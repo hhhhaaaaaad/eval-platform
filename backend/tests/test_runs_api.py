@@ -58,6 +58,21 @@ def _make_user(db: Session, *, role: str) -> _Actor:
 def _cleanup(db: Session, user_id: int) -> None:
     db.rollback()
     # run 引用用户/实验/配置，必须先删；参数快照与模型版本也按创建者清理。
+    #
+    # 结果表要先于 run 删：它们以 ON DELETE RESTRICT 引用 eval_runs（刻意的，
+    # 有结果的跑批不该被误删）。本文件的用例都只创建 run、不跑 pipeline，
+    # 当下没有结果行；但一旦将来有用例真的跑起来，漏掉这两句会以
+    # ForeignKeyViolation 的形式失败，而报错只说「仍被引用」，不好定位。
+    db.execute(
+        text("DELETE FROM eval_run_results WHERE run_id IN "
+             "(SELECT id FROM eval_runs WHERE created_by = :uid)"),
+        {"uid": user_id},
+    )
+    db.execute(
+        text("DELETE FROM eval_case_results WHERE run_id IN "
+             "(SELECT id FROM eval_runs WHERE created_by = :uid)"),
+        {"uid": user_id},
+    )
     db.execute(text("DELETE FROM eval_runs WHERE created_by = :uid"), {"uid": user_id})
     # 守卫是**单行表**（CHECK id = 1）：只能清 owner，绝不能删行。
     # 删掉那一行会让后续所有独占用例报「guard 未初始化」——这个坑踩过一次，
@@ -431,3 +446,183 @@ class TestQueryAndCancel:
     def test_unknown_experiment_get_is_404(self, client: TestClient, admin: _Actor) -> None:
         resp = client.get(f"/api/v1/experiments/{uuid.uuid4()}", headers=admin.headers)
         assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# 结果查询（P1-A2）
+# ---------------------------------------------------------------------------
+
+
+def _insert_run_metric(
+    db: Session, run_id: str, dimension: str, name: str, value: float
+) -> None:
+    db.execute(
+        text(
+            "INSERT INTO eval_run_results(run_id, dimension, metric_name, metric_value, detail) "
+            "VALUES (:r, :d, :m, :v, '{}'::jsonb)"
+        ),
+        {"r": run_id, "d": dimension, "m": name, "v": value},
+    )
+
+
+def _insert_case(db: Session, version_id: int, content_hash: str) -> int:
+    return db.execute(
+        text(
+            "INSERT INTO eval_cases(dataset_version_id, case_type, group_key, content_hash, "
+            "payload, ground_truth) "
+            "VALUES (:v, 'query_to_memory', 'g', :h, '{}'::jsonb, '{}'::jsonb) RETURNING id"
+        ),
+        {"v": version_id, "h": content_hash},
+    ).scalar_one()
+
+
+def _insert_case_result(
+    db: Session, run_id: str, case_id: int, dimension: str, recall: float
+) -> None:
+    db.execute(
+        text(
+            "INSERT INTO eval_case_results(run_id, case_id, dimension, metric_values, detail) "
+            "VALUES (:r, :c, :d, CAST(:mv AS jsonb), '{}'::jsonb)"
+        ),
+        {
+            "r": run_id,
+            "c": case_id,
+            "d": dimension,
+            "mv": json.dumps({"recall_at_k": recall}),
+        },
+    )
+
+
+class TestResults:
+    """结果查询 API 的契约。
+
+    直接往结果表写行，而不是跑一遍 pipeline：本组测的是**读**接口的契约
+    （按维度分组、分页、404 与「还没结果」的区分）。写入路径已由
+    ``test_engine_pipeline`` 的结果落库用例覆盖，这里再跑一遍 pipeline
+    要多 mock 一整套 Java 端点，收益不成比例。
+    """
+
+    @pytest.fixture
+    def version_id(self, seeded_config: dict[str, int]) -> int:
+        return seeded_config["dataset_version_id"]
+
+    @pytest.fixture
+    def run_id(
+        self,
+        client: TestClient,
+        admin: _Actor,
+        seeded_config: dict[str, int],
+        dispatched: _Dispatched,
+    ) -> str:
+        resp = client.post(
+            "/api/v1/runs", json=_payload(seeded_config, mode="exact"), headers=admin.headers
+        )
+        assert resp.status_code == 201
+        return resp.json()["id"]
+
+    def test_run_without_results_is_empty_list_not_404(
+        self, client: TestClient, admin: _Actor, run_id: str
+    ) -> None:
+        """还没算出结果不是 404。
+
+        run 可能仍在跑、或已失败——调用方需要能从响应里区分「跑完了但没结果」
+        与「这个 run 根本不存在」。用 404 表示前者会让前端为「还没跑完」
+        单独写一套错误分支。
+        """
+        resp = client.get(f"/api/v1/runs/{run_id}/results", headers=admin.headers)
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["dimensions"] == []
+        assert body["run_id"] == run_id
+        assert body["status"] in ("pending", "running")
+
+    def test_results_are_grouped_by_dimension_sorted(
+        self,
+        client: TestClient,
+        db: Session,
+        admin: _Actor,
+        run_id: str,
+    ) -> None:
+        _insert_run_metric(db, run_id, "retrieval", "recall_at_k", 0.5)
+        _insert_run_metric(db, run_id, "retrieval", "ndcg_at_k", 0.6)
+        _insert_run_metric(db, run_id, "injection", "over_budget_rate", 0.0)
+        db.commit()
+
+        body = client.get(f"/api/v1/runs/{run_id}/results", headers=admin.headers).json()
+
+        # 顺序确定：维度和指标名都排序，前端图例不会每次刷新都变。
+        assert [item["dimension"] for item in body["dimensions"]] == ["injection", "retrieval"]
+        assert body["dimensions"][1]["metrics"] == {"ndcg_at_k": 0.6, "recall_at_k": 0.5}
+
+    def test_cases_pagination_reports_total(
+        self,
+        client: TestClient,
+        db: Session,
+        admin: _Actor,
+        run_id: str,
+        version_id: int,
+    ) -> None:
+        for index in range(5):
+            case_id = _insert_case(db, version_id, f"h{index}")
+            _insert_case_result(db, run_id, case_id, "retrieval", index / 10)
+        db.commit()
+
+        first = client.get(f"/api/v1/runs/{run_id}/cases?limit=2", headers=admin.headers).json()
+        assert first["total"] == 5 and first["limit"] == 2 and first["offset"] == 0
+        assert len(first["cases"]) == 2
+
+        second = client.get(
+            f"/api/v1/runs/{run_id}/cases?limit=2&offset=2", headers=admin.headers
+        ).json()
+        # 分页必须不重不漏——这依赖 reader 里那个确定性的 ORDER BY case_id。
+        assert {c["case_id"] for c in first["cases"]} & {
+            c["case_id"] for c in second["cases"]
+        } == set()
+
+        rest = client.get(f"/api/v1/runs/{run_id}/cases?limit=2&offset=4", headers=admin.headers).json()
+        assert len(rest["cases"]) == 1
+        assert rest["total"] == 5, "最后一页也要能拿到 total，不能靠 len<limit 反推"
+
+    def test_cases_can_be_filtered_by_dimension(
+        self,
+        client: TestClient,
+        db: Session,
+        admin: _Actor,
+        run_id: str,
+        version_id: int,
+    ) -> None:
+        case_id = _insert_case(db, version_id, "h-filter")
+        _insert_case_result(db, run_id, case_id, "retrieval", 1.0)
+        _insert_case_result(db, run_id, case_id, "injection", 0.5)
+        db.commit()
+
+        body = client.get(
+            f"/api/v1/runs/{run_id}/cases?dimension=injection", headers=admin.headers
+        ).json()
+
+        assert body["total"] == 1
+        assert body["cases"][0]["dimension"] == "injection"
+        assert body["cases"][0]["metric_values"] == {"recall_at_k": 0.5}
+
+    def test_unknown_run_results_is_404(self, client: TestClient, admin: _Actor) -> None:
+        assert (
+            client.get(f"/api/v1/runs/{uuid.uuid4()}/results", headers=admin.headers).status_code
+            == 404
+        )
+        assert (
+            client.get(f"/api/v1/runs/{uuid.uuid4()}/cases", headers=admin.headers).status_code
+            == 404
+        )
+
+    def test_viewer_can_read_results(
+        self, client: TestClient, viewer: _Actor, run_id: str
+    ) -> None:
+        """读结果不需要 admin——viewer 角色的存在意义就是看结果。"""
+        assert (
+            client.get(f"/api/v1/runs/{run_id}/results", headers=viewer.headers).status_code == 200
+        )
+        assert client.get(f"/api/v1/runs/{run_id}/cases", headers=viewer.headers).status_code == 200
+
+    def test_results_require_auth(self, client: TestClient, run_id: str) -> None:
+        assert client.get(f"/api/v1/runs/{run_id}/results").status_code == 401

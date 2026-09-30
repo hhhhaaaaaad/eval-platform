@@ -167,6 +167,15 @@ class Run(Base, TimestampMixin):
     mode: Mapped[str] = mapped_column(
         Text, nullable=False, server_default=text("'exact'")
     )
+    #: 本次 run 最多评多少条 case；``None`` = 不限量（跑数据集版本里的全部 query case）。
+    #:
+    #: **它是 run 的配置，不是进度状态**，因此有独立的列而不是塞进 ``checkpoint``。
+    #: 塞进 JSONB 的隐患很具体：``checkpoint`` 在语义上是「跑到哪了」的可变标记，
+    #: 将来任何一次清理/重置它的重构都会让 case_limit 静默变成 None——也就是
+    #: **把一个限量 10 条的 run 悄悄变成跑全量**，而且不会有任何报错。
+    #: 它同时参与 ``config_fingerprint``（见 app.params.fingerprint），
+    #: 影响并发分组，更不该是个可被顺手清掉的值。
+    case_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(
         Text, nullable=False, server_default=text("'pending'")
     )

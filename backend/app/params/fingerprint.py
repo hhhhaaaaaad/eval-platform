@@ -102,23 +102,43 @@ def model_config_hash(
     )
 
 
+#: ``case_limit=None``（不限量）在指纹里的表示。
+#: 不用 JSON 的 ``null``：拼进摘要的字面量越显眼，「这个 run 没限量」就越不容易
+#: 被与「case_limit 忘了传」混为一谈。
+_UNLIMITED = "unlimited"
+
+
 def config_fingerprint(
     *,
     params_digest: str,
     model_digest: str,
     dataset_digest: str,
     mode: str,
+    case_limit: int | None = None,
 ) -> str:
     """组合出 ``config_fingerprint``。
 
-    入参刻意用**已计算好的四个摘要**而非对象：这样调用方必须显式拿出四项，
+    入参刻意用**已计算好的摘要**而非对象：这样调用方必须显式拿出每一项，
     少一项就编译不过（而不是拿到一个「只哈希了参数」的错误指纹）。
 
     ``mode`` 做白名单校验：拼错的 mode（如 ``"HNSW"``）若不拦，会生成一个
     与 ``"hnsw"`` 不同的指纹，把同一份配置拆成两个不可比的分组。
+
+    **``case_limit`` 必须参与指纹**，这不是洁癖，有两个具体后果：
+
+    1. **可比性**：限量 10 条与跑满 100 条算出的是两个不同总体的指标
+       （小样本的 Recall 波动天然更大）。同指纹会让趋势查询把它们并成一条曲线。
+    2. **并发阻塞**：``uq_runs_active_cfg`` 限制「同一指纹同时只能有一个进行中的
+       run」——不含 case_limit 时，一个 10 条的冒烟 run 会把同配置的正式跑批
+       挡在门外，而这恰恰是最常见的操作顺序（先小样本试水、再跑全量）。
+       含它之后两者落到不同的评测命名空间，互不阻塞。
     """
     if mode not in RETRIEVAL_MODES:
         raise ValueError(f"mode 必须是 {RETRIEVAL_MODES} 之一，实际: {mode!r}")
+    if case_limit is not None and case_limit <= 0:
+        # 0 或负数在语义上不是「不限量」而是调用方算错了。放行会生成一个
+        # 实际一条 case 都跑不到、却与正常配置不同的指纹，极难排查。
+        raise ValueError(f"case_limit 必须为正整数或 None，实际: {case_limit!r}")
 
     return _digest(
         {
@@ -126,6 +146,7 @@ def config_fingerprint(
             "model_config_hash": model_digest,
             "dataset_content_digest": dataset_digest,
             "mode": mode,
+            "case_limit": _UNLIMITED if case_limit is None else case_limit,
         }
     )
 
@@ -138,6 +159,7 @@ def fingerprint_from_components(
     model_config: dict[str, Any] | None,
     dataset_content_digest: str,
     mode: str,
+    case_limit: int | None = None,
     frozen_keys: list[str] | None = None,
 ) -> str:
     """便捷入口：从原始组成部分一路算到 fingerprint。
@@ -151,4 +173,5 @@ def fingerprint_from_components(
         model_digest=model_config_hash(embedding_model_id, reranker_model_id, model_config),
         dataset_digest=dataset_content_digest,
         mode=mode,
+        case_limit=case_limit,
     )

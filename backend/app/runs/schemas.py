@@ -74,6 +74,9 @@ class RunResponse(BaseModel):
     model_version_id: int
     eval_user_id: int
     mode: str
+    #: None = 不限量。调用方需要它来判断「这次指标是跑满算出来的还是抽样算的」——
+    #: 两者的指标不可直接比较，趋势查询也要按它分组。
+    case_limit: int | None
     status: str
     exclusive: bool
     current_stage: str | None
@@ -99,3 +102,60 @@ class RunCreateResponse(RunResponse):
 
     created: bool
     enqueued: bool
+
+
+# ---------------------------------------------------------------------------
+# 结果查询（P1-A2）
+# ---------------------------------------------------------------------------
+
+
+class DimensionMetrics(BaseModel):
+    """一个维度的聚合指标。``metrics`` 是「指标名 → 值」的映射，直接喂给图表。"""
+
+    dimension: str
+    metrics: dict[str, float]
+
+
+class RunResultsResponse(BaseModel):
+    """按维度分组的聚合结果。
+
+    ``dimensions`` 用数组而不是 ``{维度: {...}}`` 的字典：字典的键顺序在 JSON 里
+    不保证，而无序的图例会让每次刷新看到的维度顺序都不同。数组显式定了序，
+    前端不必再自己排序。
+
+    维度只有运行时才知道（当前是 retrieval，后续会有 injection / governance 等），
+    所以**不能用固定字段**——加一个维度就要改响应结构的话，前端也跟着改。
+    """
+
+    run_id: uuid.UUID
+    status: str
+    dimensions: list[DimensionMetrics]
+
+
+class CaseResultResponse(BaseModel):
+    """逐 case 结果。
+
+    ``metric_values`` 与 ``detail`` 的分工见 ``app.results.service``：
+    前者是可聚合的数值，后者是解释这些数值的上下文（命中了哪些、匹配口径、
+    是否可评测）。分开是刻意的——把标识符列表混进数值字段会让「按指标过滤」没法写。
+    """
+
+    case_id: int
+    dimension: str
+    metric_values: dict[str, Any]
+    detail: dict[str, Any]
+
+
+class RunCasesResponse(BaseModel):
+    """逐 case 明细的**分页**响应。
+
+    分页不是可选项：一个评测集可以有上千条 case，一次性返回既慢又可能把
+    浏览器拖死。``total`` 让调用方知道还有多少没取，不必靠「返回条数小于 limit」
+    来推断（那在恰好整除时会误判为已取完）。
+    """
+
+    run_id: uuid.UUID
+    total: int
+    limit: int
+    offset: int
+    cases: list[CaseResultResponse]

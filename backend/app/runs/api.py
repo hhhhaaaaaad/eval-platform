@@ -15,13 +15,18 @@ from app.audit.service import write_audit
 from app.auth.deps import AdminUser, CurrentUser, DbSession
 from app.datasets.service import VersionNotFoundError
 from app.params.service import ModelVersionNotFoundError, ParamSnapshotNotFoundError
+from app.results import ResultReader
 from app.runs import dispatch
 from app.runs.schemas import (
+    CaseResultResponse,
+    DimensionMetrics,
     ExperimentCreateRequest,
     ExperimentResponse,
+    RunCasesResponse,
     RunCreateRequest,
     RunCreateResponse,
     RunResponse,
+    RunResultsResponse,
 )
 from app.runs.service import (
     ExclusiveGuardUnavailableError,
@@ -211,3 +216,73 @@ def run_state_counts(db: DbSession, _user: CurrentUser) -> dict[str, int]:
     但 ``summary/counts`` 有两段，不会与单段 UUID 路径混淆。
     """
     return RunService(db).run_state_counts()
+
+
+# ---------------------------------------------------------------------------
+# 结果查询（P1-A2）
+#
+# 这两条端点是「结果落库」的兑现出口：只写不读的话，落库是否正确根本无从验证，
+# 前端也无从取数。刻意与 pipeline 解耦——它们只读结果表，
+# 不重建任何计算，因此可以在 run 跑完之后随时调用，也能安全地并发调用。
+# ---------------------------------------------------------------------------
+
+
+@router.get("/runs/{run_id}/results", response_model=RunResultsResponse)
+def get_run_results(run_id: uuid.UUID, db: DbSession, _user: CurrentUser) -> RunResultsResponse:
+    """按维度聚合的评测结果。
+
+    **尚未产出结果不是 404**：run 可能还在跑、或已失败。此时返回 ``dimensions: []``
+    并带上 run 的真实状态，让调用方能区分「跑完了但没结果」与「这个 run 不存在」
+    （后者才是 404）。用一个空维度列表代替 404 也避免了前端为「还没跑完」
+    单独写一套错误分支。
+    """
+    service = RunService(db)
+    try:
+        run = service.get_run(run_id)
+    except RunNotFoundError as exc:
+        raise _not_found(str(exc)) from exc
+
+    grouped = ResultReader(db).all_dimension_metrics(run_id)
+    return RunResultsResponse(
+        run_id=run_id,
+        status=run.status,
+        dimensions=[
+            DimensionMetrics(dimension=dimension, metrics=metrics)
+            for dimension, metrics in sorted(grouped.items())
+        ],
+    )
+
+
+@router.get("/runs/{run_id}/cases", response_model=RunCasesResponse)
+def get_run_cases(
+    run_id: uuid.UUID,
+    db: DbSession,
+    _user: CurrentUser,
+    dimension: str | None = Query(default=None, description="按维度过滤，不传返回全部维度"),
+    limit: int = Query(default=200, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+) -> RunCasesResponse:
+    """逐 case 明细（分页）。"""
+    try:
+        RunService(db).get_run(run_id)
+    except RunNotFoundError as exc:
+        raise _not_found(str(exc)) from exc
+
+    reader = ResultReader(db)
+    rows = reader.case_results(run_id, dimension=dimension, limit=limit, offset=offset)
+    total = reader.count_case_results(run_id, dimension=dimension)
+    return RunCasesResponse(
+        run_id=run_id,
+        total=total,
+        limit=limit,
+        offset=offset,
+        cases=[
+            CaseResultResponse(
+                case_id=row.case_id,
+                dimension=row.dimension,
+                metric_values=row.metric_values,
+                detail=row.detail,
+            )
+            for row in rows
+        ],
+    )

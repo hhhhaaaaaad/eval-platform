@@ -86,6 +86,28 @@ class RetrievalCaseResult:
     missing_hashes: list[str] = field(default_factory=list)
     spurious_hashes: list[str] = field(default_factory=list)
 
+    #: 落进 ``eval_case_results.metric_values`` 的指标名。
+    #: 与 ``as_detail()`` 里其余字段（标识符列表、口径、可评测性）的分工是刻意的：
+    #: ``metric_values`` 是**可聚合的数值**，``detail`` 是**解释这些数值的上下文**。
+    #: 把 matched/missing 这类列表塞进 metric_values 会让「按指标值过滤」变得没法写。
+    METRIC_KEYS = (
+        "recall_at_k",
+        "precision_at_k",
+        "hit_at_1",
+        "reciprocal_rank",
+        "ndcg_at_k",
+    )
+
+    def as_metric_values(self) -> dict[str, float]:
+        """落进 ``eval_case_results.metric_values`` 的数值指标。"""
+        return {
+            "recall_at_k": self.recall_at_k,
+            "precision_at_k": self.precision_at_k,
+            "hit_at_1": self.hit_at_1,
+            "reciprocal_rank": self.reciprocal_rank,
+            "ndcg_at_k": self.ndcg_at_k,
+        }
+
     def as_detail(self) -> dict[str, Any]:
         """落库用的明细（与 ``eval_case_results`` 的粒度对应）。"""
         return {

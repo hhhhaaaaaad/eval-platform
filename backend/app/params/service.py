@@ -177,12 +177,16 @@ class ParamService:
         model_version_id: int,
         dataset_version_id: int,
         mode: str,
+        case_limit: int | None = None,
     ) -> dict[str, str]:
-        """把库中三份不可变配置的哈希与 mode 组合成 ``config_fingerprint``。
+        """把库中三份不可变配置的哈希、mode 与 case_limit 组合成 ``config_fingerprint``。
 
         **从库里读哈希，而不是从请求里重算**：请求携带的 params 可能与已落库的快照
         不一致（客户端算错、或快照被换过），那样算出的指纹会指向一个实际不存在于
         库中的配置组合。以库为准才能保证「同一指纹 → 同一配置」这个反查成立。
+
+        ``case_limit`` 是唯一的例外——它不是库里的配置，而是本次 run 的取数范围。
+        参与指纹的理由见 :func:`app.params.fingerprint.config_fingerprint`。
         """
         snapshot = self.get_param_snapshot(param_snapshot_id)
         model_version = self.get_model_version(model_version_id)
@@ -195,6 +199,7 @@ class ParamService:
             model_digest=model_version.config_hash,
             dataset_digest=dataset_version.content_digest,
             mode=mode,
+            case_limit=case_limit,
         )
         return {
             "config_fingerprint": fingerprint,

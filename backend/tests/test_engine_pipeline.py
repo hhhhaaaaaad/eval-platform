@@ -26,7 +26,9 @@ from app.connector import JavaEvalClient
 from app.connector.resilience import RateLimiter
 from app.db.session import get_session_factory
 from app.engine.pipeline import RunPipeline
+from app.params.fingerprint import config_fingerprint
 from app.params.service import ParamService
+from app.results import ResultWriter
 from app.runs.models import Run
 from app.runs.schemas import RunCreateRequest
 from app.runs.service import RunService
@@ -122,7 +124,17 @@ def run_id(db: Session) -> Iterator[uuid.UUID]:
     yield run.id
 
     # 按外键依赖倒序清理：run 引用版本/快照/模型版本，版本引用数据集。
+    #
+    # **结果表必须最先删**：eval_run_results / eval_case_results 分别以
+    # ON DELETE RESTRICT 引用 eval_runs / eval_cases——这是刻意的（有结果的跑批
+    # 不该被误删，审计要求）。所以清理方要先显式删结果，再删 run 与 case；
+    # 漏掉这一步的报错是 ForeignKeyViolation，信息里只说「仍被引用」，
+    # 不清理顺序的人很难第一时间想到是结果表。
     db.rollback()
+    db.execute(text("DELETE FROM eval_run_results WHERE run_id IN "
+                    "(SELECT id FROM eval_runs WHERE dataset_version_id = :v)"), {"v": version_id})
+    db.execute(text("DELETE FROM eval_case_results WHERE run_id IN "
+                    "(SELECT id FROM eval_runs WHERE dataset_version_id = :v)"), {"v": version_id})
     db.execute(text("DELETE FROM eval_runs WHERE dataset_version_id = :v"), {"v": version_id})
     db.execute(text("DELETE FROM eval_cases WHERE dataset_version_id = :v"), {"v": version_id})
     db.execute(text("DELETE FROM eval_dataset_versions WHERE id = :v"), {"v": version_id})
@@ -311,6 +323,260 @@ def test_case_details_are_persisted(
     assert {detail["query_id"] for detail in details} == {"q0", "q1"}
     # 明细要能说明命中/漏召回
     assert all("matched" in detail and "missing" in detail for detail in details)
+
+
+# ---------------------------------------------------------------------------
+# 结果落库（P1-A1）
+#
+# 这一组的价值在于：checkpoint 里那份明细是**截断到 200 条**的便捷视图，
+# 而趋势查询与逐条追溯必须走 eval_run_results / eval_case_results 两张表。
+# 只断言「pipeline 没崩」是不够的——上一版正是只写了 checkpoint，
+# 真实运行时表里一行都没有，直到做趋势查询时才发现。
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def limited_run_id(db: Session, run_id: uuid.UUID) -> uuid.UUID:
+    """与 ``run_id`` **同数据集同配置**、但 ``case_limit=1`` 的另一个 run。
+
+    能并存这件事本身就是指纹改动的证明：``case_limit`` 参与 ``config_fingerprint`` 后，
+    两个 run 落在不同的指纹与评测命名空间上，因此不撞 ``uq_runs_active_cfg``。
+    改动之前它们指纹相同，第二个 run 会直接 409。
+    """
+    row = db.execute(
+        text(
+            "SELECT dataset_version_id, param_snapshot_id, model_version_id "
+            "FROM eval_runs WHERE id = :r"
+        ),
+        {"r": str(run_id)},
+    ).one()
+    run, _ = RunService(db).create_run(
+        RunCreateRequest(
+            dataset_version_id=row[0],
+            param_snapshot_id=row[1],
+            model_version_id=row[2],
+            mode="exact",
+            case_limit=1,
+        ),
+        created_by=None,
+    )
+    db.commit()
+    return run.id
+
+
+def _run_rows(db: Session, run_id: uuid.UUID) -> dict[str, float]:
+    rows = db.execute(
+        text("SELECT metric_name, metric_value FROM eval_run_results WHERE run_id = :r"),
+        {"r": str(run_id)},
+    ).all()
+    return {name: float(value) for name, value in rows}
+
+
+@respx.mock
+def test_dimension_metrics_are_persisted_to_result_table(
+    db: Session, run_id: uuid.UUID, java: _JavaStub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    java.install()
+    outcome = _pipeline(db, monkeypatch).execute(run_id)
+    db.commit()
+
+    assert outcome.status == "succeeded"
+    stored = _run_rows(db, run_id)
+    # 落库的值必须与内存中算出的完全一致——否则「查库看到的指标」与
+    # 「run 对象上的指标」会长期不一致，且没人会发现是哪一边错了。
+    assert stored == pytest.approx(outcome.metrics)
+    assert stored["recall_at_k"] == pytest.approx(1.0)
+    assert stored["case_count"] == pytest.approx(2.0)
+
+    dimension = db.execute(
+        text("SELECT DISTINCT dimension FROM eval_run_results WHERE run_id = :r"),
+        {"r": str(run_id)},
+    ).scalars().all()
+    assert dimension == ["retrieval"]
+
+
+@respx.mock
+def test_case_results_are_persisted_per_case(
+    db: Session, run_id: uuid.UUID, java: _JavaStub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    java.install()
+    _pipeline(db, monkeypatch).execute(run_id)
+    db.commit()
+
+    rows = db.execute(
+        text("SELECT metric_values, detail FROM eval_case_results WHERE run_id = :r ORDER BY case_id"),
+        {"r": str(run_id)},
+    ).all()
+    assert len(rows) == 2, "每个 case 一行"
+
+    for metric_values, detail in rows:
+        # 数值指标落 metric_values（可聚合、可过滤）……
+        assert set(metric_values) == {
+            "recall_at_k",
+            "precision_at_k",
+            "hit_at_1",
+            "reciprocal_rank",
+            "ndcg_at_k",
+        }
+        # ……解释性上下文落 detail（标识符列表、匹配口径、可评测性）
+        assert detail["match_mode"] == "content_hash"
+        assert detail["answerable"] is True
+        assert "matched" in detail and "missing" in detail
+
+    assert {detail["query_id"] for _, detail in rows} == {"q0", "q1"}
+
+
+def test_metric_write_is_idempotent(db: Session, run_id: uuid.UUID) -> None:
+    """重复写入同一批结果不产生重复行。
+
+    执行编排的断点续跑会重放已完成阶段，而重放必须是幂等的——否则一个
+    本该无害的重放会直接撞唯一键，把 run 判成失败。
+    """
+    writer = ResultWriter(db)
+    metrics = {"recall_at_k": 0.5, "case_count": 2.0}
+
+    writer.write_dimension_metrics(run_id, "retrieval", metrics)
+    db.commit()
+    writer.write_dimension_metrics(run_id, "retrieval", {"recall_at_k": 0.75, "case_count": 2.0})
+    db.commit()
+
+    stored = _run_rows(db, run_id)
+    assert len(stored) == 2, "唯一键 (run_id, dimension, metric_name) 应把第二次写入合并掉"
+    assert stored["recall_at_k"] == pytest.approx(0.75), "后写应当覆盖先写"
+
+
+@respx.mock
+def test_resume_reads_metrics_back_from_database(
+    db: Session, run_id: uuid.UUID, java: _JavaStub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """断点续跑时，metrics 阶段从库里读回指标而不是返回空字典。
+
+    返回空字典的后果很隐蔽：finalize 会把 ``result_summary`` 写成
+    ``{"retrieval": {}}``，于是一个**成功续跑**的 run 在 API 上看起来像
+    「什么都没算出来」，而 checkpoint 又显示所有阶段都完成了。
+    """
+    java.install()
+    first = _pipeline(db, monkeypatch).execute(run_id)
+    db.commit()
+    assert first.status == "succeeded"
+
+    # 模拟「worker 在 finalize 后崩溃、run 被放回队列」：status 回到 pending、
+    # 租约清空，但 checkpoint 保留已完成的阶段（这正是续跑的依据）。
+    db.execute(
+        text("UPDATE eval_runs SET status='pending', lease_owner=NULL, heartbeat_at=NULL "
+             "WHERE id=:r"),
+        {"r": str(run_id)},
+    )
+    db.commit()
+    db.expire_all()
+
+    second = _pipeline(db, monkeypatch).execute(run_id)
+    db.commit()
+
+    assert second.status == "succeeded"
+    # search 被跳过（已完成的阶段），所以 collected 是空的——指标只可能来自库。
+    assert second.metrics["recall_at_k"] == pytest.approx(first.metrics["recall_at_k"])
+    assert second.metrics["case_count"] == pytest.approx(2.0)
+
+    run = _reload(db, run_id)
+    assert run.result_summary["retrieval"]["recall_at_k"] == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# case_limit（P1-A3）
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_case_limit_truncates_before_searching(
+    db: Session,
+    limited_run_id: uuid.UUID,
+    java: _JavaStub,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """限量必须发生在**检索之前**，而不是算完再丢。
+
+    数据集有 2 条 case、限量 1 条：检索调用次数必须是 1 而不是 2。
+    只断言「指标基于 1 条算」是不够的——先跑 1000 条再取前 10 条，
+    指标同样正确，但省不下任何时间，而省时间正是 case_limit 存在的理由
+    （抽取维度每条 case 要调一次 LLM）。
+    """
+    java.install()
+
+    outcome = _pipeline(db, monkeypatch).execute(limited_run_id)
+    db.commit()
+
+    assert outcome.status == "succeeded"
+    assert java.calls["search"] == 1, "应只检索 1 条 case"
+    assert outcome.metrics["case_count"] == 1.0
+
+    # 指标同样只落了 1 条 case 的明细——结果表不能留下被截断掉的 case
+    stored = db.execute(
+        text("SELECT count(*) FROM eval_case_results WHERE run_id = :r"),
+        {"r": str(limited_run_id)},
+    ).scalar_one()
+    assert stored == 1
+
+
+@respx.mock
+def test_case_limit_records_selected_and_available(
+    db: Session,
+    limited_run_id: uuid.UUID,
+    java: _JavaStub,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """checkpoint 要能看出「数据集里有几条、这次取了几条」。
+
+    看不出来的后果很具体：``case_limit=10`` 而数据集只有 3 条时，指标是基于 3 条算的，
+    趋势图上会出现无法解释的跳变，而没有任何地方能指出原因。
+    """
+    java.install()
+    _pipeline(db, monkeypatch).execute(limited_run_id)
+    db.commit()
+
+    checkpoint = _reload(db, limited_run_id).checkpoint
+    assert checkpoint["cases_available"] == 2
+    assert checkpoint["cases_selected"] == 1
+
+
+def test_case_limit_separates_fingerprint_and_namespace(
+    db: Session, run_id: uuid.UUID, limited_run_id: uuid.UUID
+) -> None:
+    """限量与不限量是两个不同的配置指纹、两个不同的评测命名空间。
+
+    两个后果都要成立：
+    1. 可比性——10 条与 100 条算的是不同总体的指标，不能并成一条趋势曲线；
+    2. 并发——``uq_runs_active_cfg`` 按指纹排他，不含 case_limit 时
+       一个冒烟 run 会把同配置的正式跑批挡在门外（而「先小样本试水、再跑全量」
+       恰恰是最常见的操作顺序）。
+    """
+    rows = db.execute(
+        text("SELECT id, config_fingerprint, eval_user_id, case_limit FROM eval_runs "
+             "WHERE id IN (:a, :b)"),
+        {"a": str(run_id), "b": str(limited_run_id)},
+    ).all()
+    by_limit = {limit: (fp, uid) for _, fp, uid, limit in rows}
+
+    assert set(by_limit) == {None, 1}
+    assert by_limit[None][0] != by_limit[1][0], "指纹必须不同"
+    assert by_limit[None][1] != by_limit[1][1], "评测命名空间必须不同"
+
+
+def test_case_limit_must_be_positive() -> None:
+    """0 或负数不是「不限量」而是调用方算错了，必须在指纹层就拒绝。
+
+    放行的后果：一个实际跑不到任何 case 的 run 会占住一个看似正常的并发槽位
+    （它的指纹是凭空多出来的一个分组），排查时极难想到是 case_limit 写成了 0。
+    """
+    components = {
+        "params_digest": "p",
+        "model_digest": "m",
+        "dataset_digest": "d",
+        "mode": "exact",
+    }
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="case_limit"):
+            config_fingerprint(**components, case_limit=bad)
 
 
 @respx.mock
