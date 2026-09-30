@@ -31,6 +31,18 @@ celery_app.conf.update(
     accept_content=["json"],
     timezone="UTC",
     enable_utc=True,
+    # 僵尸 run 回收：必须由**另一个进程**按固定节奏做。
+    # worker 崩溃时没人会「顺手」回收自己，只能靠 beat 定期扫。
+    #
+    # 周期取租约时长的 1/3：太密会让多个 beat 实例互相扫到对方的在途 run
+    # （回收本身是幂等的，但会产生无谓的接管与重跑）；太疏则故障恢复变慢。
+    # 与 lease 配置同源，改租约时长不必手工同步这里。
+    beat_schedule={
+        "reap-stale-runs": {
+            "task": "app.tasks.eval_tasks.reap_stale_runs",
+            "schedule": max(10.0, get_settings().run_lease_seconds / 3),
+        },
+    },
 )
 
 

@@ -307,17 +307,25 @@ class TestReaper:
         assert run.finished_at is not None
 
     def test_does_not_touch_fresh_run(self, db: Session, run_id: uuid.UUID) -> None:
-        """心跳新鲜的 run 不能被回收——否则正常跑着的任务会被中途打断。"""
+        """心跳新鲜的 run 不能被回收——否则正常跑着的任务会被中途打断。
+
+        断言**只针对本用例自己的 run**，不断言 ``result.total == 0``：
+        reaper 按设计扫全库，而库里可能还有别的会话/别的测试留下的僵尸行。
+        「全库没有僵尸」这类断言天然依赖库的洁净度，是脆弱测试的典型来源。
+        """
         LeaseManager(db).claim(run_id, "worker-1")
 
         result = LeaseManager(db).reap_stale_runs()
 
-        assert result.total == 0
+        assert run_id not in result.requeued
+        assert run_id not in result.failed
         assert _reload(db, run_id).status == "running"
 
     def test_does_not_touch_pending_run(self, db: Session, run_id: uuid.UUID) -> None:
         """pending 的 run 没有租约，不是「僵尸」。"""
-        assert LeaseManager(db).reap_stale_runs().total == 0
+        result = LeaseManager(db).reap_stale_runs()
+        assert run_id not in result.requeued
+        assert run_id not in result.failed
 
     def test_released_run_can_be_claimed_again(self, db: Session, run_id: uuid.UUID) -> None:
         """回收后应能立刻被重新调度——这是自愈闭环的最后一环。"""

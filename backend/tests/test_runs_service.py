@@ -558,12 +558,19 @@ class TestCancelAndQuery:
     def test_list_filters_by_status_and_fingerprint(
         self, db: Session, seeded_config: dict[str, int]
     ) -> None:
+        """断言一律**限定在本用例自己的 run 上**，不断言「全库没有别的 run」。
+
+        早先这里写的是 `list_runs(status="succeeded") == []`——一条对整库的断言。
+        它在单文件跑时成立，但别的测试文件会提交 succeeded 的 run 进来，
+        全量跑就红。测试之间共享一个库时，「不存在」类断言天然脆弱。
+        """
         service = RunService(db)
         run, _ = service.create_run(_request(seeded_config), created_by=None)
 
-        assert [r.id for r in service.list_runs(status="pending")] == [run.id]
+        assert run.id in [r.id for r in service.list_runs(status="pending")]
         assert [r.id for r in service.list_runs(config_fingerprint=run.config_fingerprint)] == [run.id]
-        assert service.list_runs(status="succeeded") == []
+        # 刚创建的 run 不该出现在终态列表里
+        assert run.id not in [r.id for r in service.list_runs(status="succeeded")]
 
     def test_state_counts(self, db: Session, seeded_config: dict[str, int]) -> None:
         service = RunService(db)
