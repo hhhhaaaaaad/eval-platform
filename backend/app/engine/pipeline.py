@@ -1,4 +1,15 @@
-"""run 执行编排：fencing → reset → seed → 向量就绪 → search → 指标 → finalize（EP-8）。
+"""run 执行编排：fencing → reset → seed → 向量就绪 → search → 注入 → 治理 → 指标 → finalize（EP-8）。
+
+**为什么注入与治理排到 search 之后、指标之前**：三者都是「对 case 逐个观测」，
+指标阶段再把观测转成数字。把观测与计算分开有两个好处——指标阶段保持纯计算
+（不碰网络，可用普通单测穷举），而观测阶段各自独立、互不干扰：
+某个维度的接口挂了不会连累其他维度已经采集到的观测。
+
+**注入与检索复用同一批 query case**：注入质量问的是「同样的查询，注入给模型的东西
+对不对」，换成另一批 query 就不是同一个问题了。
+
+**治理用独立的 governance case**，不掺进 query case——它的输入是「一组待治理的记忆」，
+不是查询。
 
 **编排的核心不是「按顺序调 7 个接口」，而是每一步前后的两个判断**：
 
@@ -33,13 +44,27 @@ from sqlalchemy.orm import Session
 
 from app.connector import JavaEvalClient, JavaEvalError
 from app.connector.schemas import SeedItem
+from app.datasets.digest import CASE_TYPE_GOVERNANCE, CASE_TYPE_QUERY_TO_MEMORY
 from app.datasets.models import Case, DatasetVersion
+from app.engine.dimensions.governance import (
+    GOVERNANCE_TASKS,
+    GovernanceEvaluator,
+    ReplayedDecision,
+)
+from app.engine.dimensions.injection import InjectionEvaluator
 from app.engine.dimensions.retrieval import (
     RetrievalCaseResult,
     RetrievalEvaluator,
     RetrievedItem,
 )
-from app.results import DIMENSION_RETRIEVAL, ResultReader, ResultWriter
+from app.params.models import ParamSnapshot
+from app.results import (
+    DIMENSION_GOVERNANCE,
+    DIMENSION_INJECTION,
+    DIMENSION_RETRIEVAL,
+    ResultReader,
+    ResultWriter,
+)
 from app.runs.lease import LeaseManager
 from app.runs.models import Run
 from app.settings.logging import get_logger
@@ -55,6 +80,8 @@ class Stage(str, Enum):
     SEED = "seed"
     VECTOR_READY = "vector_ready"
     SEARCH = "search"
+    INJECTION = "injection"
+    GOVERNANCE = "governance"
     METRICS = "metrics"
     FINALIZE = "finalize"
 
@@ -87,7 +114,9 @@ class PipelineOutcome:
     run_id: uuid.UUID
     status: str  # succeeded / failed / not_owned
     completed_stages: list[str] = field(default_factory=list)
-    metrics: dict[str, float] = field(default_factory=dict)
+    #: ``{维度: {指标名: 值}}``。**不做扁平化**：不同维度的指标可能同名
+    #: （比如两个维度都有 `case_count`），拍平会互相覆盖。
+    metrics: dict[str, dict[str, float]] = field(default_factory=dict)
     error: str | None = None
 
 
@@ -115,6 +144,9 @@ class RunPipeline:
         self._owner = owner
         self._lease = LeaseManager(db)
         self._evaluator = evaluator or RetrievalEvaluator()
+        # 治理评测器无状态、无构造参数，直接建一个即可（注入评测器需要注入预算，
+        # 那个值只有在 metrics 阶段读得到参数快照时才拿得到，因此在那里现建）。
+        self._governance_evaluator = GovernanceEvaluator()
         self._vector_ready_timeout = vector_ready_timeout
         self._vector_ready_poll_interval = vector_ready_poll_interval
         self._sleep = sleep
@@ -172,7 +204,7 @@ class RunPipeline:
         self._current_stage = stage
         yield
 
-    def _run_stages(self, run: Run, completed: list[str]) -> dict[str, float]:
+    def _run_stages(self, run: Run, completed: list[str]) -> dict[str, dict[str, float]]:
         """按序推进各阶段；已完成的阶段可跳过（断点续跑的基础）。"""
         with self._client_factory() as client:
             with self._stage(Stage.FENCING):
@@ -185,8 +217,12 @@ class RunPipeline:
                 self._stage_vector_ready(run, client, completed)
             with self._stage(Stage.SEARCH):
                 collected = self._stage_search(run, client, completed)
+            with self._stage(Stage.INJECTION):
+                injected = self._stage_injection(run, client, completed)
+            with self._stage(Stage.GOVERNANCE):
+                governed = self._stage_governance(run, client, completed)
             with self._stage(Stage.METRICS):
-                metrics = self._stage_metrics(run, collected, completed)
+                metrics = self._stage_metrics(run, collected, injected, governed, completed)
             with self._stage(Stage.FINALIZE):
                 self._stage_finalize(run, client, completed, metrics)
         return metrics
@@ -265,12 +301,37 @@ class RunPipeline:
         outcome = client.seed(
             run.eval_user_id, items, run_id=self._owner, fencing_version=run.fencing_version
         )
+        # 把「内容 → 记忆 id」记进 checkpoint。后续的注入与治理维度只拿得到 id
+        # （`budgeted_ids`、`items[].memoryId`），而判定相关/正确与否必须按内容比对
+        # （id 会随 reset 变化，按 id 比对不可复现）。不记的话这两个维度就只能拿到
+        # 一串无从解释的数字。
+        #
+        # 放在 checkpoint 而不是新列：它是**本次运行的中间产物**，不是配置，
+        # 且天然随 run 生命周期存在（断点续跑时 checkpoint 保留，因此 map 也还在）。
+        if outcome.content_to_id:
+            run.checkpoint = {**run.checkpoint, "seeded_content_to_id": outcome.content_to_id}
         logger.info(
             "seed 完成: inserted=%s existed=%s", outcome.inserted, outcome.existed,
             extra={"run_id": str(run.id)},
         )
         self._mark_stage(run, completed, Stage.SEED)
         return outcome.inserted + outcome.existed
+
+    def _seeded_id_to_content(self, run: Run) -> dict[int, str]:
+        """``记忆 id → 内容``，用于把 Java 侧返回的裸 id 还原成可比对的内容。
+
+        checkpoint 里的 JSONB 键只能是字符串，所以存的是「内容 → id」，
+        这里反转过来。查不到的 id 直接丢弃——它在语料之外（理论上不该出现，
+        因为 seed 前刚 reset 过），丢弃比编造一个内容更安全。
+        """
+        raw = run.checkpoint.get("seeded_content_to_id") or {}
+        mapping: dict[int, str] = {}
+        for content, memory_id in raw.items():
+            try:
+                mapping[int(memory_id)] = content
+            except (TypeError, ValueError):
+                continue
+        return mapping
 
     def _collect_seed_items(self, run: Run) -> list[SeedItem]:
         """汇总要灌进命名空间的语料，按内容去重。
@@ -378,21 +439,7 @@ class RunPipeline:
             return []
         self._check_lease(run)
 
-        cases = [
-            case
-            for case in self._db.execute(
-                select(Case).where(
-                    Case.dataset_version_id == run.dataset_version_id,
-                    Case.case_type == "query_to_memory",
-                    # 排序是**截断正确性的前提**：没有 ORDER BY 时 PostgreSQL 返回行的
-                    # 顺序不保证稳定（并发插入、vacuum、计划切换都会改变它），
-                    # 于是「限量 10 条」两次跑到的可能是不同的 10 条——指标不可复现，
-                    # 而这正是本平台最不能出的问题。按 id 排序给出一个确定且便宜的序。
-                ).order_by(Case.id)
-            ).scalars()
-        ]
-        cases = self._apply_case_limit(run, cases)
-
+        cases = self._query_cases(run)
         collected: list[tuple[Case, list[RetrievedItem]]] = []
         for case in cases:
             # 每个 case 前都续租：一个几百条的评测集可能跑很久，
@@ -413,6 +460,49 @@ class RunPipeline:
         )
         self._mark_stage(run, completed, Stage.SEARCH)
         return collected
+
+    def _query_cases(self, run: Run) -> list[Case]:
+        """本 run 要评测的 query case（已应用 case_limit）。
+
+        **排序是截断正确性的前提**：没有 ORDER BY 时 PostgreSQL 返回行的顺序不保证
+        稳定（并发插入、vacuum、计划切换都会改变它），于是「限量 10 条」两次跑到的
+        可能是不同的 10 条——指标不可复现，而这正是本平台最不能出的问题。
+        按 id 排序给出一个确定且便宜的序。
+
+        检索与注入共用这一个方法：两者的 case 集合必须完全一致，
+        否则「检索 Recall 0.9、注入却几乎没注对」这类对比就失去意义了。
+        """
+        cases = list(
+            self._db.execute(
+                select(Case)
+                .where(
+                    Case.dataset_version_id == run.dataset_version_id,
+                    Case.case_type == CASE_TYPE_QUERY_TO_MEMORY,
+                )
+                .order_by(Case.id)
+            ).scalars()
+        )
+        return self._apply_case_limit(run, cases)
+
+    def _governance_cases(self, run: Run) -> list[Case]:
+        """本 run 要评测的治理 case。
+
+        **刻意不受 case_limit 约束**：治理维度算的是「比例」（误合并率、误伤率），
+        这类指标对样本子集极其敏感——限量取前 10 条可能恰好全是正样本，
+        误伤率就永远是 0，而看的人不会知道这是抽样造成的。
+        query case 不怕限量是因为 Recall 之类的指标在抽样子集上仍然是同一口径的估计；
+        比例类指标不是。治理集本身也是人工标注的、规模小，全量跑得起。
+        """
+        return list(
+            self._db.execute(
+                select(Case)
+                .where(
+                    Case.dataset_version_id == run.dataset_version_id,
+                    Case.case_type == CASE_TYPE_GOVERNANCE,
+                )
+                .order_by(Case.id)
+            ).scalars()
+        )
 
     def _apply_case_limit(self, run: Run, cases: list[Case]) -> list[Case]:
         """按 ``run.case_limit`` 截断取数范围。
@@ -440,79 +530,242 @@ class RunPipeline:
         self._db.flush()
         return limited
 
+    def _stage_injection(
+        self, run: Run, client: JavaEvalClient, completed: list[str]
+    ) -> list[tuple[Case, int, list[str]]]:
+        """对每个 query case 跑一次 ``retrieve_context``，收集「实际注入了什么」。
+
+        与检索阶段分开调用而不是复用检索结果：两者问的不是同一件事。
+        检索问「召回了什么」（top-K 候选），注入问「最终塞进 prompt 的是什么」
+        （经预算裁剪、格式化之后）。预算裁剪恰恰会把一些召回的条目剔掉，
+        而「剔得对不对」正是注入维度的核心。
+        """
+        if Stage.INJECTION.value in completed:
+            return []
+        self._check_lease(run)
+
+        id_to_content = self._seeded_id_to_content(run)
+        collected: list[tuple[Case, int, list[str]]] = []
+        unresolved = 0
+        for case in self._query_cases(run):
+            self._check_lease(run)
+            response = client.retrieve_context(
+                run.eval_user_id,
+                str(case.payload.get("query") or ""),
+                top_k=self._evaluator.k,
+            )
+            injected = []
+            for memory_id in response.budgeted_ids:
+                if memory_id in id_to_content:
+                    injected.append(id_to_content[memory_id])
+                else:
+                    unresolved += 1
+            collected.append((case, response.token_count, injected))
+
+        if unresolved:
+            # 不能静默：解析不到的 id 会被当成「没注入」，于是无关注入率虚低，
+            # 看起来像「注入得很干净」。解析不到的根因通常是 seed 的 contentToId
+            # 丢了（例如旧 run 的 checkpoint 里没有这份映射），是数据问题不是模型问题。
+            logger.warning(
+                "注入维度有 %d 个 budgeted_id 无法还原成内容（seed 映射缺失或不完整），"
+                "这些条目被当作未注入处理，无关注入率会偏低",
+                unresolved,
+                extra={"run_id": str(run.id)},
+            )
+        logger.info(
+            "注入观测完成: %d 个 case", len(collected), extra={"run_id": str(run.id)}
+        )
+        self._mark_stage(run, completed, Stage.INJECTION)
+        return collected
+
+    def _stage_governance(
+        self, run: Run, client: JavaEvalClient, completed: list[str]
+    ) -> list[tuple[Case, list[Any]]]:
+        """对治理 case 跑 ``governance/replay``，收集实际决策。
+
+        **每种 task 只调一次 replay**，而不是每个 case 一次：replay 的入参是
+        「跑哪几类治理分析」的开关，不是「针对哪条记忆」。同一 task 下的所有 case
+        共享同一次分析的输出。按开关逐 task 调用（而不是四个开关全开调一次）
+        是为了能**把决策归属到 task**——全开时返回的是一个混合列表，
+        无法判断某条决策来自重复检测还是过期检测。
+        """
+        if Stage.GOVERNANCE.value in completed:
+            return []
+        self._check_lease(run)
+
+        cases = self._governance_cases(run)
+        if not cases:
+            logger.info("无治理 case，跳过治理维度", extra={"run_id": str(run.id)})
+            self._mark_stage(run, completed, Stage.GOVERNANCE)
+            return []
+
+        tasks = sorted(
+            {
+                str(case.payload.get("task") or "")
+                for case in cases
+                if str(case.payload.get("task") or "")
+            }
+        )
+        by_task: dict[str, list[Any]] = {}
+        for task in tasks:
+            self._check_lease(run)
+            flags = {name: name == task for name in GOVERNANCE_TASKS}
+            decisions = client.governance_replay(run.eval_user_id, **flags)
+            by_task[task] = [ReplayedDecision.from_connector_decision(item) for item in decisions]
+
+        collected = [
+            (case, by_task.get(str(case.payload.get("task") or ""), [])) for case in cases
+        ]
+        logger.info(
+            "治理观测完成: %d 个 case, task=%s",
+            len(collected),
+            tasks,
+            extra={"run_id": str(run.id)},
+        )
+        self._mark_stage(run, completed, Stage.GOVERNANCE)
+        return collected
+
     def _stage_metrics(
         self,
         run: Run,
         collected: list[tuple[Case, list[RetrievedItem]]],
+        injected: list[tuple[Case, int, list[str]]],
+        governed: list[tuple[Case, list[Any]]],
         completed: list[str],
-    ) -> dict[str, float]:
-        """算指标 → 落库。此阶段不碰网络，纯计算。"""
+    ) -> dict[str, dict[str, float]]:
+        """算各维度指标并落库。此阶段不碰网络，纯计算。"""
         if Stage.METRICS.value in completed:
             # 断点续跑：指标已经算过并落库了，从库里读回来而不是返回空字典。
-            # 返回空字典会让 finalize 把 result_summary 写成 {"retrieval": {}}，
+            # 返回空字典会让 finalize 把 result_summary 写成 `{}`，
             # 于是一个「续跑成功」的 run 在 API 上看起来像「什么都没算出来」。
-            return ResultReader(self._db).dimension_metrics(run.id, DIMENSION_RETRIEVAL)
+            return ResultReader(self._db).all_dimension_metrics(run.id)
 
-        results: list[RetrievalCaseResult] = [
+        writer = ResultWriter(self._db)
+        by_dimension: dict[str, dict[str, float]] = {}
+
+        retrieval_results: list[RetrievalCaseResult] = [
             self._evaluator.evaluate_case(
                 payload=case.payload, ground_truth=case.ground_truth, retrieved=retrieved
             )
             for case, retrieved in collected
         ]
-        metrics = self._evaluator.aggregate(results)
-
-        self._persist_metrics(run, collected, results, metrics)
-
-        # checkpoint 里仍留一份截断明细：它是「run 对象自带的一眼可见视图」，
-        # 便于只看一个 run 的 JSON 就能判断发生了什么的场景（含 case 数超限标记）。
-        # **权威存储在 eval_run_results / eval_case_results**，趋势查询与逐条追溯
-        # 都走那两张表——JSONB 上做跨 run 聚合不可行。
-        run.checkpoint = {
-            **run.checkpoint,
-            "case_details": [result.as_detail() for result in results[:200]],
-            "case_details_truncated": len(results) > 200,
-        }
-        run.result_summary = {"retrieval": metrics, "case_total": len(results)}
-        self._db.flush()
-
-        self._mark_stage(run, completed, Stage.METRICS)
-        return metrics
-
-    def _persist_metrics(
-        self,
-        run: Run,
-        collected: list[tuple[Case, list[RetrievedItem]]],
-        results: list[RetrievalCaseResult],
-        metrics: dict[str, float],
-    ) -> None:
-        """把维度级聚合与逐 case 明细写进结果表。
-
-        ``collected`` 与 ``results`` 是**位置一一对应**的（同一列表推导产生），
-        用 ``zip`` 关联而非按 query_id 查表：query_id 允许重复（schema 只要求非空），
-        按它关联会在重复时静默错配到错误的那条 case。
-        """
-        writer = ResultWriter(self._db)
+        by_dimension[DIMENSION_RETRIEVAL] = self._evaluator.aggregate(retrieval_results)
         writer.write_dimension_metrics(
             run.id,
             DIMENSION_RETRIEVAL,
-            metrics,
-            detail={"match_mode": results[0].match_mode if results else None},
+            by_dimension[DIMENSION_RETRIEVAL],
+            detail={"match_mode": retrieval_results[0].match_mode if retrieval_results else None},
         )
+        # collected 与 results 位置一一对应（同一列表推导产生），用 zip 关联而非按
+        # query_id 查表：query_id 允许重复（schema 只要求非空），按它关联会在重复时
+        # 静默错配到错误的那条 case。
         writer.write_case_metrics(
             run.id,
             DIMENSION_RETRIEVAL,
             (
                 (case.id, result.as_metric_values(), result.as_detail())
-                for (case, _), result in zip(collected, results, strict=True)
+                for (case, _), result in zip(collected, retrieval_results, strict=True)
             ),
         )
+
+        if injected:
+            injection_evaluator = InjectionEvaluator(
+                inject_max_tokens=self._snapshot_inject_max_tokens(run)
+            )
+            injection_results = [
+                injection_evaluator.evaluate_case(
+                    payload=case.payload,
+                    ground_truth=case.ground_truth,
+                    token_count=token_count,
+                    injected_contents=contents,
+                )
+                for case, token_count, contents in injected
+            ]
+            by_dimension[DIMENSION_INJECTION] = injection_evaluator.aggregate(injection_results)
+            writer.write_dimension_metrics(
+                run.id,
+                DIMENSION_INJECTION,
+                by_dimension[DIMENSION_INJECTION],
+                detail={"inject_max_tokens": injection_evaluator.inject_max_tokens},
+            )
+            writer.write_case_metrics(
+                run.id,
+                DIMENSION_INJECTION,
+                (
+                    ((case.id), result.as_metric_values(), result.as_detail())
+                    for (case, _, _), result in zip(injected, injection_results, strict=True)
+                ),
+            )
+
+        if governed:
+            governance_results = [
+                self._governance_evaluator.evaluate_case(
+                    payload=case.payload,
+                    ground_truth=case.ground_truth,
+                    decisions=decisions,
+                    id_to_content=self._seeded_id_to_content(run),
+                )
+                for case, decisions in governed
+            ]
+            by_dimension[DIMENSION_GOVERNANCE] = self._governance_evaluator.aggregate(
+                governance_results
+            )
+            writer.write_dimension_metrics(
+                run.id, DIMENSION_GOVERNANCE, by_dimension[DIMENSION_GOVERNANCE]
+            )
+            writer.write_case_metrics(
+                run.id,
+                DIMENSION_GOVERNANCE,
+                (
+                    (case.id, result.as_metric_values(), result.as_detail())
+                    for (case, _), result in zip(governed, governance_results, strict=True)
+                ),
+            )
+
+        # checkpoint 里仍留一份截断明细：它是「run 对象自带的一眼可见视图」，
+        # 便于只看一个 run 的 JSON 就能判断发生了什么（含 case 数超限标记）。
+        # **权威存储在 eval_run_results / eval_case_results**，趋势查询与逐条追溯
+        # 都走那两张表——JSONB 上做跨 run 聚合不可行。
+        run.checkpoint = {
+            **run.checkpoint,
+            "case_details": [result.as_detail() for result in retrieval_results[:200]],
+            "case_details_truncated": len(retrieval_results) > 200,
+        }
+        run.result_summary = {
+            **by_dimension,
+            "case_total": len(retrieval_results),
+        }
+        self._db.flush()
+
+        self._mark_stage(run, completed, Stage.METRICS)
+        return by_dimension
+
+    def _snapshot_inject_max_tokens(self, run: Run) -> int:
+        """从**参数快照**（而非 Java 当前配置）读注入预算。
+
+        用快照而不是 ``client.params()``：快照是这个 run 冻结下来的配置，
+        Java 侧的当前值可能已经改过。用当前值算出来的「超预算率」会把
+        「这次跑超了」和「后来把预算调小了」混在一起，指标失去可比性。
+
+        缺失时直接失败而不是取个默认值：默认值会让指标看起来正常，
+        实际衡量的是一个不属于这个 run 的预算。
+        """
+        snapshot = self._db.get(ParamSnapshot, run.param_snapshot_id)
+        value = (snapshot.params or {}).get("inject_max_tokens") if snapshot else None
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise PipelineFailure(
+                f"参数快照缺少可用的 inject_max_tokens（snapshot_id={run.param_snapshot_id}，"
+                f"实际值={value!r}），无法评测注入维度",
+                stage=Stage.METRICS,
+            )
+        return value
 
     def _stage_finalize(
         self,
         run: Run,
         client: JavaEvalClient,
         completed: list[str],
-        metrics: dict[str, float],
+        metrics: dict[str, dict[str, float]],
     ) -> None:
         """清理 → 释放 fencing → CAS 置成功。**顺序不可调换。**
 
@@ -540,8 +793,10 @@ class RunPipeline:
             )
 
         self._mark_stage(run, completed, Stage.FINALIZE)
+        # result_summary 的形状就是 {维度: {指标名: 值}}——与 _stage_metrics 的返回同构，
+        # 不再包一层 "retrieval"（多维度之后那层包装只会让取数的人多写一次解包）。
         if not self._lease.finish(
-            run.id, self._owner, status="succeeded", result_summary={"retrieval": metrics}
+            run.id, self._owner, status="succeeded", result_summary=metrics
         ):
             # 走到这里说明租约在 finalize 期间易主：结果没写进去，
             # 但工作已经做完了——这属于「白干」，记录清楚即可。

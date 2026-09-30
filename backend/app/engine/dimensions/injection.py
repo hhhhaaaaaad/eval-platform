@@ -133,6 +133,26 @@ class InjectionCaseResult:
     relevant_hashes: list[str] = field(default_factory=list)
     irrelevant_hashes: list[str] = field(default_factory=list)
 
+    #: 落进 ``eval_case_results.metric_values`` 的指标名。
+    #: 与 ``as_detail()`` 里其余字段（标识符列表、可评测性）的分工见
+    #: ``app.results.service``：可聚合的数值与解释它们的上下文分开存。
+    METRIC_KEYS = (
+        "token_utilization",
+        "irrelevant_injection_rate",
+    )
+
+    def as_metric_values(self) -> dict[str, float]:
+        """落进 ``eval_case_results.metric_values`` 的数值指标。
+
+        ``over_budget`` 是布尔而非数值，故不进这里——它放进 ``detail``。
+        想按它筛 case 的人用 ``detail.over_budget``：JSONB 的布尔字段照样能过滤，
+        而把它转成 0/1 塞进数值列只会让「这个维度有哪些数值指标」变得含混。
+        """
+        return {
+            "token_utilization": self.token_utilization,
+            "irrelevant_injection_rate": self.irrelevant_injection_rate,
+        }
+
     def as_detail(self) -> dict[str, Any]:
         """落库用的明细（与 ``eval_case_results`` 的粒度对应）。"""
         return {

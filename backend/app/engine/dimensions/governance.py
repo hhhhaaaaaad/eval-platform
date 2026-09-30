@@ -83,6 +83,14 @@ TASK_HALLUCINATION = "hallucination"
 #: 参与本维度评测的任务。
 EVALUABLE_TASKS = frozenset({TASK_DUPLICATES, TASK_EXPIRED, TASK_HALLUCINATION})
 
+#: ``governance/replay`` 支持的全部 task 开关，顺序固定。
+#:
+#: 比 :data:`EVALUABLE_TASKS` **多一个 ``consistency``**：它可以被 replay 计算，
+#: 只是本维度不评它（一致性靠离线巡检扫库统计，路径不同）。
+#: 两者不能混用——用 EVALUABLE_TASKS 去构造 replay 的开关就会漏掉 consistency，
+#: 那些 case 会拿到空决策列表，进而被误判成「该动没动」。
+GOVERNANCE_TASKS = (TASK_DUPLICATES, TASK_CONSISTENCY, TASK_EXPIRED, TASK_HALLUCINATION)
+
 #: 规范化后的动作。Java 侧 ``GovernanceDecision.action`` ∈ MERGE / ARCHIVE /
 #: DISPUTE / QUARANTINE（见 connector/schemas.py）。
 ACTION_MERGE = "MERGE"
@@ -261,6 +269,26 @@ class GovernanceCaseResult:
     expected_target_hashes: list[str] = field(default_factory=list)
     actual_target_hashes: list[str] = field(default_factory=list)
 
+    #: 落进 ``eval_case_results.metric_values`` 的指标名。
+    METRIC_KEYS = (
+        "wrong_rate",
+        "missed_action_rate",
+        "false_action_rate",
+    )
+
+    def as_metric_values(self) -> dict[str, float]:
+        """落进 ``eval_case_results.metric_values`` 的数值指标。
+
+        ``wrong_target`` 是布尔、``evaluable`` 是筛选依据，都不进数值列——
+        理由同注入维度的 ``over_budget``：转成 0/1 会让「这个维度有哪些数值指标」
+        变得含混，而 JSONB 里的布尔字段照样能按它过滤。
+        """
+        return {
+            "wrong_rate": self.wrong_rate,
+            "missed_action_rate": self.missed_action_rate,
+            "false_action_rate": self.false_action_rate,
+        }
+
     def as_detail(self) -> dict[str, Any]:
         """落库用的明细（与 ``eval_case_results`` 的粒度对应）。"""
         return {
@@ -393,6 +421,7 @@ __all__ = [
     "ACTION_MERGE",
     "ACTION_QUARANTINE",
     "EVALUABLE_TASKS",
+    "GOVERNANCE_TASKS",
     "TASK_CONSISTENCY",
     "TASK_DUPLICATES",
     "TASK_EXPIRED",

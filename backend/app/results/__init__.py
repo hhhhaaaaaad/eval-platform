@@ -7,6 +7,18 @@
 指标计算本身在 :mod:`app.engine`，本包只负责「把算出来的东西存好、取出来」。
 """
 
-from app.results.service import DIMENSION_RETRIEVAL, ResultReader, ResultWriter
+from app.results.service import (
+    DIMENSION_GOVERNANCE,
+    DIMENSION_INJECTION,
+    DIMENSION_RETRIEVAL,
+    ResultReader,
+    ResultWriter,
+)
 
-__all__ = ["DIMENSION_RETRIEVAL", "ResultReader", "ResultWriter"]
+__all__ = [
+    "DIMENSION_GOVERNANCE",
+    "DIMENSION_INJECTION",
+    "DIMENSION_RETRIEVAL",
+    "ResultReader",
+    "ResultWriter",
+]

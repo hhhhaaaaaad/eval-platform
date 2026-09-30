@@ -159,6 +159,14 @@ class _JavaStub:
         self.finalize_reset_fails = False
         self.calls: dict[str, int] = {}
         self.seed_requests: list[dict] = []
+        self.retrieve_context_requests: list[dict] = []
+        self.governance_replay_requests: list[dict] = []
+        #: 注入维度用的返回值：默认把 seed 出来的两条都注入、token 数远低于预算。
+        self.budgeted_ids: list[int] = [1, 2]
+        self.inject_token_count = 100
+        #: ``{task: [决策...]}``，按 replay 请求里唯一为真的开关取。
+        self.replay_by_task: dict[str, list[dict]] = {}
+        self.replay_tasks: list[str | None] = []
 
     def _count(self, name: str) -> None:
         self.calls[name] = self.calls.get(name, 0) + 1
@@ -173,6 +181,10 @@ class _JavaStub:
         respx.post(_url("/api/v1/eval/seed")).mock(side_effect=self._seed)
         respx.get(_url("/api/v1/eval/metrics")).mock(side_effect=self._metrics)
         respx.post(_url("/api/v1/eval/search")).mock(side_effect=self._search)
+        respx.post(_url("/api/v1/eval/retrieve-context")).mock(side_effect=self._retrieve_context)
+        respx.post(_url("/api/v1/eval/governance/replay")).mock(
+            side_effect=self._governance_replay
+        )
 
     # -- 各端点 ----------------------------------------------------------
 
@@ -209,10 +221,49 @@ class _JavaStub:
         self._count("seed")
         # 记下请求体：seed 的**内容**（几条、什么类型、含不含干扰项）只能从这里看，
         # 响应里的 inserted/existed 计数说明不了语料选对没有。
-        self.seed_requests.append(json.loads(request.content))
+        body = json.loads(request.content)
+        self.seed_requests.append(body)
+        # contentToId 按请求里的顺序给 id（1 起）。真实 Java 侧由数据库自增产生，
+        # 这里造一份等价映射，让注入维度有 id 可还原——返回空映射的话
+        # 所有 budgeted_id 都解析不到，注入维度会以「什么都没注入」的形式静默通过。
+        content_to_id = {item["content"]: index + 1 for index, item in enumerate(body["items"])}
         return httpx.Response(
-            200, json=_envelope(data={"inserted": 2, "existed": 0, "contentToId": {}})
+            200,
+            json=_envelope(
+                data={
+                    "inserted": len(content_to_id),
+                    "existed": 0,
+                    "contentToId": content_to_id,
+                }
+            ),
         )
+
+    def _retrieve_context(self, request: httpx.Request) -> httpx.Response:
+        self._count("retrieve_context")
+        body = json.loads(request.content)
+        self.retrieve_context_requests.append(body)
+        return httpx.Response(
+            200,
+            json=_envelope(
+                data={
+                    "formatted": "...",
+                    "tokenCount": self.inject_token_count,
+                    "budgetedIds": self.budgeted_ids,
+                }
+            ),
+        )
+
+    def _governance_replay(self, request: httpx.Request) -> httpx.Response:
+        self._count("governance_replay")
+        body = json.loads(request.content)
+        self.governance_replay_requests.append(body)
+        # replay 的入参是「跑哪几类治理分析」的开关，没有 task 字段。按**唯一为真**
+        # 的那个开关判断本次请求是针对哪个 task 的——这也顺带验证了 pipeline
+        # 确实是逐 task 调用而不是四个开关全开（全开时这里会是 None）。
+        enabled = [name for name, value in body.items() if value is True]
+        task = enabled[0] if len(enabled) == 1 else None
+        self.replay_tasks.append(task)
+        return httpx.Response(200, json=_envelope(data=self.replay_by_task.get(task, [])))
 
     def _metrics(self, request: httpx.Request) -> httpx.Response:
         self._count("metrics")
@@ -284,8 +335,8 @@ def test_happy_path_succeeds_and_computes_metrics(
     db.commit()
 
     assert outcome.status == "succeeded"
-    assert outcome.metrics["recall_at_k"] == pytest.approx(1.0)
-    assert outcome.metrics["case_count"] == 2.0
+    assert outcome.metrics["retrieval"]["recall_at_k"] == pytest.approx(1.0)
+    assert outcome.metrics["retrieval"]["case_count"] == 2.0
 
     run = _reload(db, run_id)
     assert run.status == "succeeded"
@@ -297,6 +348,8 @@ def test_happy_path_succeeds_and_computes_metrics(
         "seed",
         "vector_ready",
         "search",
+        "injection",
+        "governance",
         "metrics",
         "finalize",
     ]
@@ -369,10 +422,19 @@ def limited_run_id(db: Session, run_id: uuid.UUID) -> uuid.UUID:
     return run.id
 
 
-def _run_rows(db: Session, run_id: uuid.UUID) -> dict[str, float]:
+def _run_rows(db: Session, run_id: uuid.UUID, *, dimension: str = "retrieval") -> dict[str, float]:
+    """取某 run 某维度的聚合指标。
+
+    **必须按维度过滤**：检索与注入共用同一批 query case，两个维度都会落行，
+    不过滤就会把两个维度的指标混进同一个字典（两边都有 `case_count`，
+    后者还会覆盖前者）。
+    """
     rows = db.execute(
-        text("SELECT metric_name, metric_value FROM eval_run_results WHERE run_id = :r"),
-        {"r": str(run_id)},
+        text(
+            "SELECT metric_name, metric_value FROM eval_run_results "
+            "WHERE run_id = :r AND dimension = :d"
+        ),
+        {"r": str(run_id), "d": dimension},
     ).all()
     return {name: float(value) for name, value in rows}
 
@@ -389,15 +451,17 @@ def test_dimension_metrics_are_persisted_to_result_table(
     stored = _run_rows(db, run_id)
     # 落库的值必须与内存中算出的完全一致——否则「查库看到的指标」与
     # 「run 对象上的指标」会长期不一致，且没人会发现是哪一边错了。
-    assert stored == pytest.approx(outcome.metrics)
+    assert stored == pytest.approx(outcome.metrics["retrieval"])
     assert stored["recall_at_k"] == pytest.approx(1.0)
     assert stored["case_count"] == pytest.approx(2.0)
 
-    dimension = db.execute(
-        text("SELECT DISTINCT dimension FROM eval_run_results WHERE run_id = :r"),
+    dimensions = db.execute(
+        text("SELECT DISTINCT dimension FROM eval_run_results WHERE run_id = :r ORDER BY 1"),
         {"r": str(run_id)},
     ).scalars().all()
-    assert dimension == ["retrieval"]
+    # 检索与注入共用同一批 query case，所以两个维度都会有结果；
+    # 治理维度没有 governance case，因此不出现（而不是出现一个空维度）。
+    assert dimensions == ["injection", "retrieval"]
 
 
 @respx.mock
@@ -409,7 +473,10 @@ def test_case_results_are_persisted_per_case(
     db.commit()
 
     rows = db.execute(
-        text("SELECT metric_values, detail FROM eval_case_results WHERE run_id = :r ORDER BY case_id"),
+        text(
+            "SELECT metric_values, detail FROM eval_case_results "
+            "WHERE run_id = :r AND dimension = 'retrieval' ORDER BY case_id"
+        ),
         {"r": str(run_id)},
     ).all()
     assert len(rows) == 2, "每个 case 一行"
@@ -480,8 +547,10 @@ def test_resume_reads_metrics_back_from_database(
 
     assert second.status == "succeeded"
     # search 被跳过（已完成的阶段），所以 collected 是空的——指标只可能来自库。
-    assert second.metrics["recall_at_k"] == pytest.approx(first.metrics["recall_at_k"])
-    assert second.metrics["case_count"] == pytest.approx(2.0)
+    assert second.metrics["retrieval"]["recall_at_k"] == pytest.approx(
+        first.metrics["retrieval"]["recall_at_k"]
+    )
+    assert second.metrics["retrieval"]["case_count"] == pytest.approx(2.0)
 
     run = _reload(db, run_id)
     assert run.result_summary["retrieval"]["recall_at_k"] == pytest.approx(1.0)
@@ -513,14 +582,18 @@ def test_case_limit_truncates_before_searching(
 
     assert outcome.status == "succeeded"
     assert java.calls["search"] == 1, "应只检索 1 条 case"
-    assert outcome.metrics["case_count"] == 1.0
+    assert outcome.metrics["retrieval"]["case_count"] == 1.0
 
-    # 指标同样只落了 1 条 case 的明细——结果表不能留下被截断掉的 case
+    # 指标同样只落了 1 条 case 的明细——结果表不能留下被截断掉的 case。
+    # 按维度统计：检索与注入各 1 行，两个维度都不能多。
     stored = db.execute(
-        text("SELECT count(*) FROM eval_case_results WHERE run_id = :r"),
+        text(
+            "SELECT dimension, count(*) FROM eval_case_results WHERE run_id = :r "
+            "GROUP BY dimension ORDER BY dimension"
+        ),
         {"r": str(limited_run_id)},
-    ).scalar_one()
-    assert stored == 1
+    ).all()
+    assert stored == [("injection", 1), ("retrieval", 1)]
 
 
 @respx.mock
@@ -678,6 +751,212 @@ def test_seed_uses_declared_corpus_including_distractors(
     assert by_content["用户用 Java 17"] == "fact"
     # 类型保真：走 ground-truth 回退路径时这里会退化成 "fact"（内容里没有类型信息）。
     assert by_content["用户偏好美式咖啡"] == "preference"
+
+    db.execute(text("DELETE FROM eval_run_results WHERE run_id = :r"), {"r": str(run.id)})
+    db.execute(text("DELETE FROM eval_case_results WHERE run_id = :r"), {"r": str(run.id)})
+    db.execute(text("DELETE FROM eval_runs WHERE id = :r"), {"r": str(run.id)})
+    db.execute(text("DELETE FROM eval_cases WHERE dataset_version_id = :v"), {"v": version_id})
+    db.execute(text("DELETE FROM eval_dataset_versions WHERE id = :v"), {"v": version_id})
+    db.execute(text("DELETE FROM eval_datasets WHERE id = :d"), {"d": dataset_id})
+    db.execute(text("DELETE FROM eval_param_snapshots WHERE id = :s"), {"s": snapshot.id})
+    db.execute(text("DELETE FROM eval_model_versions WHERE id = :m"), {"m": model.id})
+    db.commit()
+
+
+@respx.mock
+def test_injection_dimension_is_evaluated_and_persisted(
+    db: Session, run_id: uuid.UUID, java: _JavaStub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """注入维度接线端到端：调一次 retrieve_context、还原 id、落库。
+
+    seed 出来的两条（stub 给它们 id 1、2）都被注入，且都在 ground truth 里：
+    无关注入率应为 0，token 利用率 = 100 / 2000 = 0.05。
+    这几个数字把「id → 内容」的还原链路也一起钉住了——还原失败时注入列表为空，
+    无关注入率会算成 0，用例会在 `injected_total` 上暴露。
+    """
+    java.install()
+    outcome = _pipeline(db, monkeypatch).execute(run_id)
+    db.commit()
+
+    assert outcome.status == "succeeded"
+    assert java.calls["retrieve_context"] == 2, "每个 query case 一次"
+
+    injection = outcome.metrics["injection"]
+    assert injection["case_count_total"] == 2.0
+    assert injection["case_count_scored"] == 2.0
+    assert injection["irrelevant_injection_rate"] == pytest.approx(0.0)
+    assert injection["over_budget_rate"] == pytest.approx(0.0)
+    assert injection["token_utilization"] == pytest.approx(0.05)
+
+    detail = db.execute(
+        text(
+            "SELECT detail FROM eval_case_results "
+            "WHERE run_id = :r AND dimension = 'injection' LIMIT 1"
+        ),
+        {"r": str(run_id)},
+    ).scalar_one()
+    assert detail["injected_total"] == 2, "id 必须被还原成内容，否则这里会是 0"
+    assert detail["irrelevant_total"] == 0
+    assert detail["over_budget"] is False
+    # 注入预算取自**参数快照**而不是 Java 当前配置，并记进明细供解释
+    assert detail["inject_max_tokens"] == 2000
+
+
+@respx.mock
+def test_governance_replays_once_per_task_and_is_not_case_limited(
+    db: Session, java: _JavaStub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """治理维度接线：逐 task 调 replay、决策按 task 归属、且**不受 case_limit 约束**。
+
+    两件事一起验，因为它们共同决定治理指标可不可信：
+
+    1. 逐 task 调用（而不是四个开关全开调一次）——全开时返回的是混合列表，
+       无法判断某条决策来自重复检测还是过期检测，指标算错了也没法解释；
+    2. 不限量——治理算的是比例类指标，限量取到的子集可能恰好全是正样本，
+       误伤率就永远是 0，而看的人不知道这是抽样造成的。
+    """
+    suffix = uuid.uuid4().hex[:8]
+    dataset_id = db.execute(
+        text("INSERT INTO eval_datasets(name) VALUES (:n) RETURNING id"),
+        {"n": f"gov-{suffix}"},
+    ).scalar_one()
+    version_id = db.execute(
+        text(
+            "INSERT INTO eval_dataset_versions(dataset_id, version, schema_version, source, "
+            "content_digest, config) "
+            "VALUES (:d, 'v1', 1, 'cli', :digest, CAST(:c AS jsonb)) RETURNING id"
+        ),
+        {
+            "d": dataset_id,
+            "digest": f"sha256:{uuid.uuid4().hex}",
+            "c": json.dumps(
+                {
+                    "corpus": [
+                        {"content": "用户用 Java 17", "type": "fact"},
+                        {"content": "用户偏好美式咖啡", "type": "preference"},
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ).scalar_one()
+
+    def _add_case(case_type: str, group: str, payload: dict, ground_truth: dict) -> None:
+        db.execute(
+            text(
+                "INSERT INTO eval_cases(dataset_version_id, case_type, group_key, content_hash, "
+                "payload, ground_truth) VALUES "
+                "(:v, :t, :g, :h, CAST(:p AS jsonb), CAST(:g2 AS jsonb))"
+            ),
+            {
+                "v": version_id,
+                "t": case_type,
+                "g": group,
+                "h": f"sha256:{uuid.uuid4().hex}",
+                "p": json.dumps(payload, ensure_ascii=False),
+                "g2": json.dumps(ground_truth, ensure_ascii=False),
+            },
+        )
+
+    # 两条 query case（给 case_limit 一点东西可限）
+    for index in range(2):
+        _add_case(
+            "query_to_memory",
+            "g",
+            {"query_id": f"q{index}", "query": "用户用什么技术栈？"},
+            {"relevant_memory_contents": ["用户用 Java 17"]},
+        )
+    # duplicates：期望「把 Java 那条合并进咖啡那条」，stub 会返回完全一致的决策 → 无错
+    _add_case(
+        "governance",
+        "dup",
+        {"task": "duplicates"},
+        {
+            "decisions": [
+                {
+                    "action": "MERGE",
+                    "memory_contents": ["用户用 Java 17"],
+                    "merged_into_content": "用户偏好美式咖啡",
+                }
+            ]
+        },
+    )
+    # expired：期望归档，stub 返回空 → 漏判
+    _add_case(
+        "governance",
+        "exp",
+        {"task": "expired"},
+        {"decisions": [{"action": "ARCHIVE", "memory_contents": ["用户用 Java 17"]}]},
+    )
+
+    snapshot, _ = ParamService(db).get_or_create_param_snapshot(
+        name=f"gov-snap-{suffix}",
+        params={
+            "vector_store": f"gov-{suffix}",
+            "rrf_k": 60,
+            "alpha": 0.5,
+            "beta": 0.3,
+            "recency_half_life_days": 14.0,
+            "profile_boost": 0.2,
+            "min_confidence": 0.4,
+            "inject_max_tokens": 2000,
+        },
+    )
+    model, _ = ParamService(db).get_or_create_model_version(
+        embedding_model_id=f"gov-emb-{suffix}", reranker_model_id=f"gov-rr-{suffix}"
+    )
+    # case_limit=1：只该限制 query case，治理 case 必须全跑
+    run, _ = RunService(db).create_run(
+        RunCreateRequest(
+            dataset_version_id=version_id,
+            param_snapshot_id=snapshot.id,
+            model_version_id=model.id,
+            mode="exact",
+            case_limit=1,
+        ),
+        created_by=None,
+    )
+    db.commit()
+
+    # stub：seed 顺序决定 id——id 1 = "用户用 Java 17"、id 2 = "用户偏好美式咖啡"
+    java.replay_by_task = {
+        "duplicates": [{"action": "MERGE", "mergedIntoId": 2, "items": [{"memoryId": 1}]}],
+        "expired": [],
+    }
+    java.install()
+    outcome = _pipeline(db, monkeypatch).execute(run.id)
+    db.commit()
+
+    assert outcome.status == "succeeded"
+
+    # 1) 逐 task 调用，且每次只开对应开关（replay_tasks 里出现 None 就说明全开了）
+    assert sorted(java.replay_tasks) == ["duplicates", "expired"]
+    assert java.calls["governance_replay"] == 2
+
+    # 2) 不限量：case_limit=1 只砍掉 query case，治理两条都评了
+    assert outcome.metrics["retrieval"]["case_count"] == 1.0
+    assert outcome.metrics["governance"]["case_count"] == 2.0
+
+    # 3) 决策按 task 正确归属。用**按 task 分开的**比率来断言比用总比率更能验归属：
+    #    duplicates 完全匹配 → 误合并率 0；expired 漏判 → 误归档率 1。
+    #    若归属错了（比如把 expired 的决策算到 duplicates 上），这两个数字会互换位置。
+    governance = outcome.metrics["governance"]
+    assert governance["duplicates_count"] == 1.0
+    assert governance["expired_count"] == 1.0
+    assert governance["wrong_merge_rate"] == pytest.approx(0.0)
+    assert governance["wrong_archive_rate"] == pytest.approx(1.0)
+    assert governance["missed_action_rate"] == pytest.approx(0.5)
+    assert governance["false_action_rate"] == pytest.approx(0.0)
+
+    db.execute(text("DELETE FROM eval_run_results WHERE run_id = :r"), {"r": str(run.id)})
+    db.execute(text("DELETE FROM eval_case_results WHERE run_id = :r"), {"r": str(run.id)})
+    db.execute(text("DELETE FROM eval_runs WHERE id = :r"), {"r": str(run.id)})
+    db.execute(text("DELETE FROM eval_cases WHERE dataset_version_id = :v"), {"v": version_id})
+    db.execute(text("DELETE FROM eval_dataset_versions WHERE id = :v"), {"v": version_id})
+    db.execute(text("DELETE FROM eval_datasets WHERE id = :d"), {"d": dataset_id})
+    db.execute(text("DELETE FROM eval_param_snapshots WHERE id = :s"), {"s": snapshot.id})
+    db.execute(text("DELETE FROM eval_model_versions WHERE id = :m"), {"m": model.id})
+    db.commit()
 
     # 本用例自己造了数据集/版本/run（没有走 run_id 那套带清理的夹具），
     # 必须自己收尾。顺序仍是「先结果、再 run、最后配置」——结果表是 RESTRICT 外键。

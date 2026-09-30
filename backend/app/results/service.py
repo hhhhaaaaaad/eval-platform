@@ -44,6 +44,8 @@ logger = get_logger(__name__)
 #: 维度标识。与 ``app.engine.dimensions`` 下的模块一一对应，落库后用于分组查询。
 #: 刻意用字符串常量而不是 Enum：新增维度时不必改数据库里的历史值。
 DIMENSION_RETRIEVAL = "retrieval"
+DIMENSION_INJECTION = "injection"
+DIMENSION_GOVERNANCE = "governance"
 
 
 def _to_decimal(value: float, *, where: str) -> Decimal:
