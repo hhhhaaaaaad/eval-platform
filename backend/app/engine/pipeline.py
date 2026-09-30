@@ -33,7 +33,7 @@ from sqlalchemy.orm import Session
 
 from app.connector import JavaEvalClient, JavaEvalError
 from app.connector.schemas import SeedItem
-from app.datasets.models import Case
+from app.datasets.models import Case, DatasetVersion
 from app.engine.dimensions.retrieval import (
     RetrievalCaseResult,
     RetrievalEvaluator,
@@ -273,7 +273,28 @@ class RunPipeline:
         return outcome.inserted + outcome.existed
 
     def _collect_seed_items(self, run: Run) -> list[SeedItem]:
-        """汇总该版本所有 ground-truth 内容作为语料，按内容去重。"""
+        """汇总要灌进命名空间的语料，按内容去重。
+
+        **优先取版本级的 ``config["corpus"]``**，没有才回退到「从各 case 的
+        ground truth 里汇总」。两条路径并存是过渡期的现实，但差别很实质：
+
+        从 case 的 ground truth 汇总有两个缺陷，且都只会让指标**虚高**：
+
+        1. **干扰项全丢**。只有被某条 query 引用过的记忆才会被灌进去，
+           而真实检索场景里绝大多数记忆与当前查询无关。少了这些干扰项，
+           检索随便返回什么都更容易命中——Recall 会系统性偏高。
+        2. **记忆类型失真**。``relevant_memory_contents`` 只有内容没有类型，
+           ``_ground_truth_entries`` 只能一律当作 ``fact``。类型参与检索时的
+           ``budgetByType`` 预算分配，类型错了会让注入预算的分配方式与真实场景不符。
+
+        版本级 ``corpus`` 能同时带内容与类型、且天然包含干扰项，因此是更真实的语料集。
+        回退路径保留是为了兼容尚未携带 corpus 的旧数据集（如冒烟脚本造的临时集），
+        而不是鼓励继续用它。
+        """
+        corpus = self._load_declared_corpus(run)
+        if corpus is not None:
+            return corpus
+
         cases = list(
             self._db.execute(
                 select(Case).where(Case.dataset_version_id == run.dataset_version_id)
@@ -288,6 +309,30 @@ class RunPipeline:
                     continue
                 seen.add(content)
                 items.append(SeedItem(type=memory_type, content=content))
+        return items
+
+    def _load_declared_corpus(self, run: Run) -> list[SeedItem] | None:
+        """读取版本级 ``config["corpus"]``；未声明时返回 ``None``（走回退路径）。
+
+        返回空列表与返回 ``None`` 的区别是刻意的：前者表示「显式声明了一个空语料」，
+        那是个配置错误，应当由调用方按「没有可 seed 的内容」处理；
+        后者才表示「这个版本没这个概念」。
+        """
+        version = self._db.get(DatasetVersion, run.dataset_version_id)
+        raw = (version.config or {}).get("corpus") if version is not None else None
+        if not isinstance(raw, list):
+            return None
+
+        seen: set[str] = set()
+        items: list[SeedItem] = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            content = entry.get("content")
+            if not isinstance(content, str) or not content.strip() or content in seen:
+                continue
+            seen.add(content)
+            items.append(SeedItem(type=str(entry.get("type") or "fact"), content=content))
         return items
 
     def _stage_vector_ready(self, run: Run, client: JavaEvalClient, completed: list[str]) -> None:

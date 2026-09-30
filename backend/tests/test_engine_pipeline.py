@@ -13,6 +13,7 @@ Java 侧全部用 respx 拦截，Postgres 是真的——编排的分支与顺�
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import Iterator
 
@@ -157,6 +158,7 @@ class _JavaStub:
         ]
         self.finalize_reset_fails = False
         self.calls: dict[str, int] = {}
+        self.seed_requests: list[dict] = []
 
     def _count(self, name: str) -> None:
         self.calls[name] = self.calls.get(name, 0) + 1
@@ -205,6 +207,9 @@ class _JavaStub:
 
     def _seed(self, request: httpx.Request) -> httpx.Response:
         self._count("seed")
+        # 记下请求体：seed 的**内容**（几条、什么类型、含不含干扰项）只能从这里看，
+        # 响应里的 inserted/existed 计数说明不了语料选对没有。
+        self.seed_requests.append(json.loads(request.content))
         return httpx.Response(
             200, json=_envelope(data={"inserted": 2, "existed": 0, "contentToId": {}})
         )
@@ -577,6 +582,114 @@ def test_case_limit_must_be_positive() -> None:
     for bad in (0, -1):
         with pytest.raises(ValueError, match="case_limit"):
             config_fingerprint(**components, case_limit=bad)
+
+
+# ---------------------------------------------------------------------------
+# 版本级语料（P1.5）
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_seed_uses_declared_corpus_including_distractors(
+    db: Session, java: _JavaStub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """版本声明了 ``config.corpus`` 时，seed 必须灌它——**包括干扰项**。
+
+    这是「指标会不会虚高」的分水岭。从各 case 的 ground truth 汇总语料时，
+    只有被某条 query 引用过的记忆会被灌进去，检索时几乎没有干扰项，
+    随便返回什么都更容易命中，Recall 系统性偏高——而指标看起来完全正常。
+    """
+    suffix = uuid.uuid4().hex[:8]
+    dataset_id = db.execute(
+        text("INSERT INTO eval_datasets(name) VALUES (:n) RETURNING id"),
+        {"n": f"corpus-{suffix}"},
+    ).scalar_one()
+    version_id = db.execute(
+        text(
+            "INSERT INTO eval_dataset_versions(dataset_id, version, schema_version, source, "
+            "content_digest, config) "
+            "VALUES (:d, 'v1', 1, 'cli', :digest, CAST(:c AS jsonb)) RETURNING id"
+        ),
+        {
+            "d": dataset_id,
+            "digest": f"sha256:{uuid.uuid4().hex}",
+            # 两条相关 + 一条干扰项（不被任何 query 引用）
+            "c": json.dumps(
+                {
+                    "corpus": [
+                        {"content": "用户用 Java 17", "type": "fact"},
+                        {"content": "用户偏好美式咖啡", "type": "preference"},
+                        {"content": "用户养了一只叫豆豆的猫", "type": "fact"},
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ).scalar_one()
+    db.execute(
+        text(
+            "INSERT INTO eval_cases(dataset_version_id, case_type, group_key, content_hash, "
+            "payload, ground_truth) "
+            "VALUES (:v, 'query_to_memory', 'g', :h, CAST(:p AS jsonb), CAST(:g AS jsonb))"
+        ),
+        {
+            "v": version_id,
+            "h": f"sha256:{uuid.uuid4().hex}",
+            "p": '{"query_id": "q0", "query": "用户用什么技术栈？"}',
+            "g": '{"relevant_memory_contents": ["用户用 Java 17"]}',
+        },
+    )
+    snapshot, _ = ParamService(db).get_or_create_param_snapshot(
+        name=f"corpus-snap-{suffix}",
+        params={
+            "vector_store": f"corpus-{suffix}",
+            "rrf_k": 60,
+            "alpha": 0.5,
+            "beta": 0.3,
+            "recency_half_life_days": 14.0,
+            "profile_boost": 0.2,
+            "min_confidence": 0.4,
+            "inject_max_tokens": 2000,
+        },
+    )
+    model, _ = ParamService(db).get_or_create_model_version(
+        embedding_model_id=f"corpus-emb-{suffix}", reranker_model_id=f"corpus-rr-{suffix}"
+    )
+    run, _ = RunService(db).create_run(
+        RunCreateRequest(
+            dataset_version_id=version_id,
+            param_snapshot_id=snapshot.id,
+            model_version_id=model.id,
+            mode="exact",
+        ),
+        created_by=None,
+    )
+    db.commit()
+
+    java.install()
+    outcome = _pipeline(db, monkeypatch).execute(run.id)
+    db.commit()
+
+    assert outcome.status == "succeeded"
+    items = java.seed_requests[-1]["items"]
+    assert len(items) == 3, "干扰项也必须被灌进去"
+
+    by_content = {item["content"]: item["type"] for item in items}
+    assert by_content["用户用 Java 17"] == "fact"
+    # 类型保真：走 ground-truth 回退路径时这里会退化成 "fact"（内容里没有类型信息）。
+    assert by_content["用户偏好美式咖啡"] == "preference"
+
+    # 本用例自己造了数据集/版本/run（没有走 run_id 那套带清理的夹具），
+    # 必须自己收尾。顺序仍是「先结果、再 run、最后配置」——结果表是 RESTRICT 外键。
+    db.execute(text("DELETE FROM eval_run_results WHERE run_id = :r"), {"r": str(run.id)})
+    db.execute(text("DELETE FROM eval_case_results WHERE run_id = :r"), {"r": str(run.id)})
+    db.execute(text("DELETE FROM eval_runs WHERE id = :r"), {"r": str(run.id)})
+    db.execute(text("DELETE FROM eval_cases WHERE dataset_version_id = :v"), {"v": version_id})
+    db.execute(text("DELETE FROM eval_dataset_versions WHERE id = :v"), {"v": version_id})
+    db.execute(text("DELETE FROM eval_datasets WHERE id = :d"), {"d": dataset_id})
+    db.execute(text("DELETE FROM eval_param_snapshots WHERE id = :s"), {"s": snapshot.id})
+    db.execute(text("DELETE FROM eval_model_versions WHERE id = :m"), {"m": model.id})
+    db.commit()
 
 
 @respx.mock
